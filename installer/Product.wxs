@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Schoel GradeGuard"
+           Manufacturer="Schoel Engineering"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="9D0A53EA-6D07-43BD-A9E8-4512BFD54B26"
+           Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Schoel GradeGuard is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="GradeGuardIcon" SourceFile="gradeguard_icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="GradeGuardIcon" />
+
+    <Feature Id="MainFeature" Title="Schoel GradeGuard" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="SCHOELTOOLS" Name="SchoelTools">
+        <Directory Id="APPFOLDER" Name="SchoelGradeGuard" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ProgramMenuSchoel" Name="Schoel Engineering" />
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
+
+    <ComponentGroup Id="AppFiles" Directory="APPFOLDER">
+      <Component Guid="A0FB879D-A6A1-4607-9B74-E08AA62206A7">
+        <File Id="MainExe" Source="$(var.MainExePath)" KeyPath="yes" />
+      </Component>
+      <Component Guid="F418A389-3BE9-49EC-9090-72694E00122F">
+        <File Source="GradeGuard_v9_Civil3D_Import.lsp" KeyPath="yes" />
+      </Component>
+      <Component Guid="880E21C5-A7D7-4886-9AE8-F19D879646BC">
+        <File Source="GradeGuard_Import_BC_Points.lsp" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <DirectoryRef Id="ProgramMenuSchoel">
+      <Component Id="StartMenuShortcut" Guid="CC7EB3D2-7464-49F3-8E58-699B6914D72B">
+        <Shortcut Id="LaunchShortcut" Name="Schoel GradeGuard" Target="[#MainExe]" WorkingDirectory="APPFOLDER" Icon="GradeGuardIcon" />
+        <RemoveFolder Id="RemoveProgramMenuSchoel" Directory="ProgramMenuSchoel" On="uninstall" />
+        <RegistryValue Root="HKLM" Key="Software\Schoel\GradeGuard" Name="InstallDir" Type="string" Value="[APPFOLDER]" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="75656348-A43C-4E85-984C-1DFE4630BD6F">
+        <Shortcut Id="DesktopLaunchShortcut" Name="Schoel GradeGuard" Target="[#MainExe]" WorkingDirectory="APPFOLDER" Icon="GradeGuardIcon" />
+        <RegistryValue Root="HKLM" Key="Software\Schoel\GradeGuard" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+  </Package>
+</Wix>

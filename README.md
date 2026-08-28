@@ -4,7 +4,7 @@ Schoel GradeGuard is an internal survey-office application for producing and rev
 
 ## Status
 
-- Current version: 9.0.3
+- Current version: 9.0.4
 - Status: pre-release validation
 - Intended users: Schoel Engineering survey-office personnel
 - Maintainer: Joseph Conniv
@@ -19,6 +19,8 @@ GradeGuard output requires office review and appropriate licensed-surveyor valid
 ## Build the Windows application
 
 Run `build_exe.bat`. Generated executables and build caches are intentionally excluded from source control.
+
+For a signed release, run `Build_Signed_MSI.ps1`. It builds the EXE and MSI, signs both from the approved Windows certificate store, verifies both signatures, and writes a SHA-256 release manifest. Private certificate files and passwords are never stored in this repository.
 
 ## Test
 

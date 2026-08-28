@@ -29,7 +29,7 @@ except Exception:
     fitz = None
 
 Point2 = Tuple[float, float]
-APP_VERSION = "9.0.3"
+APP_VERSION = "9.0.4"
 
 @dataclass
 class GenPoint:

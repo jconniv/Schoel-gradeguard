@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [9.0.4] - 2026-08-28
+
+### Added
+
+- Added a versioned WiX MSI installer for per-machine deployment under `C:\SchoelTools\SchoelGradeGuard`.
+- Added certificate-store signing and verification for both the GradeGuard EXE and MSI.
+- Added a SHA-256 release manifest for update verification and traceability.
+
+### Security
+
+- Signing uses the installed Schoel Engineering private certificate without committing or copying PFX files, passwords, or private-key material into the repository.
+
+### Survey/data impact
+
+- Packaging and signing only. No calculations, coordinates, elevations, units, datums, precision, imports, exports, or QA rules changed.
+
 ## [9.0.3] - 2026-08-28
 
 ### Fixed

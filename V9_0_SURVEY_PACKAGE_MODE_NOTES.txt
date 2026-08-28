@@ -1,5 +1,10 @@
 Schoel GradeGuard v9.0 Survey Package Mode
 
+v9.0.4 signed installer patch (2026-08-28):
+- Adds a versioned, signed MSI release workflow.
+- Signs and verifies both the EXE and MSI using the installed Schoel certificate.
+- Creates a SHA-256 release manifest without storing private certificate material.
+
 v9.0.3 BOC ambiguity safety patch (2026-08-28):
 - BOC may mean BACK OF CURB or BOTTOM OF CURB depending on the engineer.
 - Bare BOC HP/LP callouts are review-only and never automatically hard-held or converted.
