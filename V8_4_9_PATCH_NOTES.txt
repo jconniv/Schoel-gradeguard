@@ -1,0 +1,26 @@
+Schoel GradeGuard v8.4.9 Patch Notes
+
+Purpose:
+Fix the Brayfield Crest south curb error where a normal BC point near the south end was being overwritten to 615.000 even though the DXF contour control south of the curb end is 610.000.
+
+Root cause:
+The v8.4.7/v8.4.8 station contour profile was still using a global selected-BC station chain in some cases. When multiple curb pieces or parallel curb/gutter lines were selected, a contour anchor from a different curb run could land at a similar station and overwrite the local curb elevation.
+
+Fixes:
+1. Local curb-run stationing
+   GradeGuard now stations contour controls on the curb segment/component the point actually lies on, not every selected curb segment as one artificial chain.
+
+2. Near-point contour hold
+   If a BC point is within a tight tolerance of a DXF contour, the contour is held directly at that BC station.
+
+3. Endpoint-extension contour control
+   If the curb stops short but a contour is just beyond the start/end of the curb along the curb tangent, GradeGuard projects that contour to the curb endpoint and holds that contour elevation directly.
+
+4. Direct BC contour still does not get curb height
+   Curb height is only added for selected FL/gutter/EP controls.
+
+5. HP/LP protection remains
+   BC HP and BC LP points are still hard locked and cannot be smoothed or averaged through unless a trusted HP/LP callout controls them.
+
+Brayfield test intent:
+The south curb endpoint should now see the nearby 610 contour beyond the curb end instead of being overwritten by a different 615 contour control.

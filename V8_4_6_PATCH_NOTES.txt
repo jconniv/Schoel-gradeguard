@@ -1,0 +1,18 @@
+Schoel GradeGuard v8.4.6
+
+Fix: short-gap contour to selected BC logic.
+
+Problem found on Brayfield Crest: points 6041, 6005, 6006, and 6017 were being influenced by a nearby 610 contour, but the program could add the standard curb height or miss the control because the CAD linework stopped short of a mathematical intersection.
+
+Changes:
+- If a contour endpoint stops short of selected BC within a small gap, GradeGuard now projects it to the selected BC and holds the contour elevation directly.
+- If a selected BC endpoint stops short of a contour segment, GradeGuard now creates a direct BC control at that endpoint.
+- Nearby direct contour evidence within 2.50 ft of selected BC is held directly even when surface mode is flowline/pavement.
+- No curb height is added to these short-gap BC contour controls.
+- FL/gutter controls still add the selected/default curb height only when they are actually selected/detected as FL/gutter.
+
+This preserves:
+- Standard curb default +0.50 when using true FL/gutter controls.
+- HP/LP protection.
+- BC station interpolation between valid controls.
+- PDF leader/tick endpoint anchoring.

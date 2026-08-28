@@ -1,0 +1,23 @@
+V8.4 patch notes
+
+This package is patched from the uploaded SchoelGradeGuard_v8_3 source.
+
+Changed files:
+- schoel_gradeguard.py
+- README.txt
+- V8_4_PATCH_NOTES.txt
+
+Important source changes:
+- Window title/report version changed to v8.4.
+- Added v8.4 QA BooleanVars and checklist frame.
+- Added curb_type_var with Catch/Spill/Custom choices.
+- Added _qa_missing_items() and _selected_curb_height_and_note().
+- Generate BC Points now blocks if the required QA checklist is incomplete.
+- Generate BC Points passes selected_curb_height into the existing generation engine.
+- generate_bc_points() records v8.4 PDF/detail confirmation and treats 0.42, 0.58, or custom as verified once the checklist is complete.
+
+Not changed:
+- Existing v8.3 curve geometry fixes.
+- Existing selected BC/FL contour chain interpolation.
+- Existing field CSV no-header format.
+- Existing sidewalk, storm/sanitary FL OUT, subgrade, finished grade, offset, report, and water-flow outputs.

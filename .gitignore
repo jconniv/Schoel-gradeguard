@@ -1,0 +1,31 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build artifacts and executables
+build/
+dist/
+*.spec
+
+# Generated GradeGuard outputs and local job state
+GradeGuard_Output/
+GradeGuard_Tick_Anchors.json
+GradeGuard_Selected_BC_Entities.json
+GradeGuard_Selected_Flowline_Entities.json
+GradeGuard_Selected_Edge_Sidewalk_Entities.json
+GradeGuard_Manual_FL_OUT_Points.json
+*.ggproj
+
+# Test/tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editor and OS files
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

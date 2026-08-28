@@ -1,0 +1,17 @@
+Schoel GradeGuard v8.4.7 Patch Notes
+
+Main fix:
+- GradeGuard now accounts for the distance along the selected BC station to the contour control.
+- Short-gap contours projected to the selected BC are treated as direct BC contour controls.
+- Direct BC contour controls do not receive curb height.
+- Normal BC points can now be corrected from the selected-BC contour profile even when they already had a wrong nonzero elevation from a lower-priority FL/gutter or generic surface source.
+
+Survey rule:
+- Contour at BC = exact contour elevation.
+- Point between BC contour controls = interpolate/prorate by station distance along BC.
+- FL/gutter/EP contour = add verified curb height only when it truly comes from the selected FL/gutter/EP.
+- HP/LP points remain protected and are not averaged through.
+
+Why this matters:
+- A contour may stop short of the curb line in CAD but clearly controls the curb location on the PDF/DXF.
+- The program now projects that contour to the selected BC, records its station, then measures every generated BC point by station distance to that contour control.

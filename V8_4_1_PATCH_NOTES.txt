@@ -1,0 +1,24 @@
+Schoel GradeGuard v8.4.1 Patch Notes
+
+Purpose:
+Fix excessive 0.000 BC elevations when valid contour/control elevations exist nearby on the selected BC chain.
+
+What changed:
+1. Added fill_missing_bc_elevations_by_station_interpolation().
+   - Projects generated points onto the selected BC chain.
+   - Uses nonzero BC/control elevations as anchors.
+   - Holds a nearby control when the point is almost on it.
+   - Interpolates by station between valid controls.
+   - Does not bridge long unsupported gaps.
+
+2. Fixed sanitizer ordering.
+   - Previous v8.4 could zero good interpolated values because the issue text contained the word REVIEW.
+   - v8.4.1 accepts high-confidence interpolation/control tokens before rejecting generic review wording.
+
+3. Added debug stat:
+   - v8_4_1_post_station_interpolation_filled
+
+Important:
+PDF still controls over CAD/DXF. Curb detail must still be confirmed.
+Catch curb remains +0.42 ft. Spill curb remains +0.58 ft.
+CSV remains P,N,E,Z,D with no header.

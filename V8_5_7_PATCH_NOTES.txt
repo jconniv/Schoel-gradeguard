@@ -1,0 +1,20 @@
+Schoel GradeGuard v8.5.7 Patch Notes
+
+Fix:
+Point 6006 type jump near a low point cluster.
+
+Problem:
+A normal BC point that was nearly on top of a BC LP could be pulled to an isolated endpoint extension contour beyond the curb end. This created a false vertical cliff between adjacent points.
+
+Rule:
+HP and LP controls are vertical break locations. Normal BC points within 1.25 ft of a trusted HP or LP hold that HP or LP elevation unless a direct PDF/manual callout overrides it.
+
+Still locked:
+Contour hits actual selected BC: hold exact contour elevation.
+Contour hits selected EP, FL, or gutter: add curb height.
+Standard curb height: +0.50 ft unless the PDF detail says otherwise.
+Normal points between controls: prorate by station along the connected BC run.
+HP and LP: always hold and are never averaged through.
+
+Added:
+AutoLISP importer for CAD named GradeGuard_Import_BC_Points.lsp.

@@ -1,0 +1,17 @@
+Schoel GradeGuard v8.4.5
+
+Fixes curb height default.
+
+Previous v8.4 builds defaulted to catch curb +0.42. That was wrong for standard curb work.
+
+v8.4.5 behavior:
+- Standard curb is the default and uses +0.50 ft.
+- Catch curb +0.42 is used only when selected based on the certified PDF detail.
+- Spill curb +0.58 is used only when selected based on the certified PDF detail.
+- Custom height is used only when it comes from the certified PDF detail.
+- BC station interpolation remains active.
+- HP/LP protection remains active.
+- PDF to DXF callout endpoint anchoring remains active.
+- Civil PDF remains required.
+
+This is meant to prevent GradeGuard from adding +0.42 to standard curb projects that only call out normal 18 inch curb and gutter.

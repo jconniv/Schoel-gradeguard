@@ -1,0 +1,19 @@
+Schoel GradeGuard v8.4.8 Patch Notes
+
+Purpose:
+- Harden HP/LP protection.
+
+Changes:
+- Added HP/LP hard-lock routine.
+- True HP, LP, HP_TC, and LP_TC callouts now force the exact callout elevation at the leader/tick/projected BC point.
+- HP/LP hard-lock runs before station contour profile corrections and again after the field-elevation sanitizer.
+- HP/LP points are never averaged, interpolated through, or overwritten by BC station contour interpolation.
+- HP/LP points with no trusted callout elevation remain 0.000 and flagged for review.
+- Added debug stats:
+  - v8_4_8_hp_lp_hard_locked
+  - v8_4_8_hp_lp_relocked_after_sanitize
+  - v8_4_8_hp_lp_hold_rule
+
+Survey rule:
+- Normal BC points interpolate by station between contour controls.
+- True HP/LP points are vertical break points and hold the callout elevation exactly.

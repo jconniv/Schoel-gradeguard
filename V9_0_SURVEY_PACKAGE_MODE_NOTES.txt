@@ -1,0 +1,43 @@
+Schoel GradeGuard v9.0 Survey Package Mode
+
+v9.0.3 BOC ambiguity safety patch (2026-08-28):
+- BOC may mean BACK OF CURB or BOTTOM OF CURB depending on the engineer.
+- Bare BOC HP/LP callouts are review-only and never automatically hard-held or converted.
+- Confirm the engineer's plan legend/convention, then use a manual tick anchor with the verified meaning.
+
+v9.0.2 HP/LP release-safety patch (2026-08-28):
+- Compound HP/LP curb callouts are parsed once at their strongest meaning.
+- HP EL./ELEV and LP EL./ELEV forms are recognized.
+- Automatic PDF HP/LP hard holds require a real leader/tick endpoint and controlled PDF-to-CAD alignment.
+- Approximate or text-center PDF detections require office review and a manual tick anchor.
+
+v9.0.1 performance patch (2026-08-28):
+- BC generation now runs in a guarded background worker so the window remains responsive on older computers.
+- The Generate button shows an in-progress state and blocks accidental duplicate jobs.
+- Dense curb point de-duplication now avoids slow all-to-all comparisons.
+- Survey calculations, outputs, coordinates, elevations, and QA rules are unchanged.
+
+This build keeps the v8.5.7 curb logic and adds survey-office package outputs.
+
+Locked rules:
+1. PDF controls.
+2. DXF gives geometry.
+3. Proposed contours build the grading surface.
+4. Contour on actual selected BC holds exact elevation.
+5. Contour on selected EP, FL, or gutter adds curb height.
+6. Standard curb height is +0.50 ft unless the PDF detail says otherwise.
+7. Normal BC points between controls prorate by station along the connected BC run.
+8. HP and LP always hold. They are never averaged through.
+9. Bad jumps and unsupported elevations are flagged for office QA.
+10. No separate Crew View Report is created.
+
+New outputs:
+- GradeGuard_Confidence_Summary.csv
+- GradeGuard_Surface_Conflict_Report.csv
+- GradeGuard_v9_Survey_Package_Manifest.txt
+- GradeGuard_v9_Civil3D_Import.lsp
+
+Confidence:
+GREEN  = trusted/ready based on strong source
+YELLOW = calculated but office review recommended
+RED    = do not stake until fixed or reviewed

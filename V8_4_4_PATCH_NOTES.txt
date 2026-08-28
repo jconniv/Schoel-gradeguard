@@ -1,0 +1,14 @@
+Schoel GradeGuard v8.4.4 Patch Notes
+
+Main fix:
+- Added automatic PDF-to-DXF callout anchoring logic.
+- PDF spot/callout elevations now try to use the leader, arrow, or tick endpoint from the PDF vector linework instead of the text box center.
+- Removed the old hard-coded 700-800 elevation filter so projects around 610-625, like Brayfield Crest Drive, can read valid PDF grades.
+- Added fallback automatic PDF/DXF extent matching when the PDF has no coordinate callouts.
+- DXF stays fixed. The PDF is what gets scaled/flipped/shifted for callout interpretation.
+- Auto matched PDF callouts are still projected to selected BC before holding elevations.
+- v8.4.1 station interpolation and v8.4.2 HP/LP protection remain active.
+
+Important safety rule:
+- The certified PDF still controls over CAD/DXF.
+- If auto PDF/DXF matching is approximate, GradeGuard records the warning in the report and continues to use selected BC projection and source flags.

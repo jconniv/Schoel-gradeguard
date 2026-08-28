@@ -1,0 +1,13 @@
+Schoel GradeGuard v8.5.5 Patch Notes
+
+Fixed crash:
+- AttributeError: CurbSegment object has no attribute source
+- Cause: v8.5.4 connected curb-run ordering reversed CurbSegment objects using a fourth source argument.
+- CurbSegment only has a, b, and layer.
+- Reversed segments now preserve a, b, and layer only.
+
+Preserved grading logic:
+- BC contour hit holds exact contour elevation.
+- EP/FL/gutter contour hit adds standard +0.50 ft unless PDF detail says otherwise.
+- Normal BC points prorate/average by station between contour controls.
+- HP and LP points remain protected and are not averaged through.

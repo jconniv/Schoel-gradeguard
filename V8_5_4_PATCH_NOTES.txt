@@ -1,0 +1,23 @@
+Schoel GradeGuard v8.5.4 Patch Notes
+
+Purpose:
+This build locks the correct curb/contour staking hierarchy.
+
+Survey rule:
+1. If a contour actually hits selected BACK OF CURB, hold the contour elevation exactly.
+   Example: 610 contour on BC = 610.000 BC.
+
+2. If a contour actually hits selected EP / FL / gutter, convert that control to BC by adding curb height.
+   Standard curb = +0.50 ft unless the certified PDF detail clearly gives another value.
+   Example: 615 contour on EP + 0.50 = 615.500 BC.
+
+3. Any normal BC point between those controls is prorated/interpolated by station along the connected selected BC run.
+   This is not nearest-contour guessing and not a generic surface overwrite.
+
+4. HP and LP callouts remain hard vertical controls and are never averaged through.
+
+Important fixes:
+- Connected curb-run stationing now uses the connected selected BC component instead of only one nearest short segment.
+- Generic Surface/TIN mode can no longer overwrite stronger BC/EP contour controls or BC station profile prorating.
+- Direct nearby contour hold tolerance was tightened so a nearby contour does not incorrectly erase an EP + curb-height result.
+- FL/EP/gutter contour controls no longer require special PDF verification when using the standard 0.50 ft curb height. PDF details can still override the height.

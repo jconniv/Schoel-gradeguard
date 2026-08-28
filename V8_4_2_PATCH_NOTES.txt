@@ -1,0 +1,17 @@
+Schoel GradeGuard v8.4.2 Patch Notes
+
+Purpose:
+- Keep the v8.4.1 BC station interpolation fix.
+- Protect true high points and low points so they are not averaged away.
+
+Changes:
+1. HP/LP plan callouts are treated as hard vertical controls.
+2. Existing HP/LP elevations are never replaced by station interpolation.
+3. If a point is identified as BC HP or BC LP but has no trustworthy held elevation, GradeGuard leaves it as 0.000 for review instead of averaging through it.
+4. Fixed sanitizer wording so LOW POINT / LP callouts are not rejected because the word LOW appears in the source or issue text.
+5. Added v8_4_2_hp_lp_hold_rule to the debug/report stats.
+
+Survey rule:
+- Interpolation is correct between contour controls along the BC station chain.
+- HP/LP callouts are not smoothing points. They are break points and must hold when the PDF/CAD callout gives an elevation.
+- If a HP/LP is marked but the elevation is not known, it must be reviewed manually rather than guessed.

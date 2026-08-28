@@ -1,0 +1,14 @@
+Schoel GradeGuard v8.5.0 patch notes
+
+Critical grading fixes:
+- Direct contour at BC now holds directly and never receives +0.50 curb height.
+- Fixes points such as 6044 where the 610 contour is at the generated BC point.
+- Adds BC_DIRECT_CONTOUR_HOLD_V850 as a trusted source.
+- Adds a second contour-profile proration pass after direct contour holds.
+- Proration uses BC station controls and is not allowed to overwrite PDF/manual/HP/LP holds.
+- Keeps standard curb +0.50 only for true selected FL/gutter/EP controls.
+- HP and LP remain hard vertical controls.
+
+Storm/drainage workflow note:
+- Storm linework should be used to identify drainage paths and inlet/low-point review areas.
+- Storm invert elevations are not used as BC elevations unless the user adds a separate verified top/grate/curb elevation callout.

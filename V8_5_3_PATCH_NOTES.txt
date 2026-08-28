@@ -1,0 +1,22 @@
+Schoel GradeGuard v8.5.3 Patch Notes
+
+Purpose:
+Fix Surface Mode curb component interpretation.
+
+Key rule:
+Contours/surfaces are not all the same component.
+A contour on selected BC holds directly.
+A contour or temporary TIN surface controlling selected EP/FL/gutter must be raised by the standard/PDF curb height to compute BC.
+
+Fixes:
+- Default surface interpretation changed to Auto.
+- Auto mode now treats direct picked BC contours as direct BC elevations.
+- Auto mode treats temporary contour TIN as pavement/EP/flowline surface and adds curb height to stake BC, unless user explicitly chooses top/back curb direct mode.
+- If a contour near a point is on selected FL/gutter/EP, GradeGuard computes BC = contour + curb height.
+- Standard curb height remains 0.50 unless PDF detail/user selection says otherwise.
+- HP and LP hard holds remain protected.
+- Direct BC contours still do not get curb height.
+
+Example:
+EP contour 615.00 at a curb point with standard curb height 0.50 exports BC 615.50.
+BC contour 610.00 directly on picked BC exports BC 610.00.

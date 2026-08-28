@@ -1,0 +1,26 @@
+Schoel GradeGuard v8.5.6 Patch Notes
+
+Fix for point 6018/6019 large elevation jump.
+
+Cause:
+The v8.5.0 contour profile cleanup pass was still allowed to overwrite points that already had
+valid curb-component controls. In the uploaded source report, point 6019 correctly found an
+FL/EP/gutter contour at 616.000 and added the standard 0.50 curb height, giving 616.500.
+A later generic profile pass then overwrote it to 611.000 by using unrelated local profile
+anchors from another curb/run. That created the big jump from 6019 to 6020.
+
+Fix:
+- FL/EP/gutter + curb-height controls are now treated as strong profile anchors.
+- Generic profile cleanup no longer overwrites:
+  - BC direct contour holds
+  - FL/EP/gutter + curb controls
+  - BC chain contour interpolation/review controls
+  - direct BC/EP contour component results
+- HP and LP remain hard locked and are never averaged through.
+- Normal BC points still prorate by station only between valid controls on the connected curb run.
+
+Locked survey rules:
+1. Contour hits actual selected BC = hold exact contour elevation.
+2. Contour hits selected EP/FL/gutter = add standard 0.50 ft unless PDF detail says otherwise.
+3. Normal BC points between component controls = prorate by station along the connected curb run.
+4. HP/LP/manual/PDF callouts = hard hold.

@@ -1,0 +1,5 @@
+ezdxf
+PyMuPDF
+reportlab
+
+scipy

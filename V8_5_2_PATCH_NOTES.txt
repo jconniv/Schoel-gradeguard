@@ -1,0 +1,13 @@
+Schoel GradeGuard v8.5.2 Surface Direct Rule
+
+This patch fixes the curb-height confusion in Surface Mode.
+
+Rules locked in:
+- Default surface interpretation is now Top/Back of Curb / grading surface direct.
+- A proposed contour/TIN surface sampled at the selected BC is used directly.
+- A 610 contour at or near the BC holds 610.000.
+- The program must not add +0.42, +0.412, or +0.50 to a direct BC/surface contour.
+- Curb height is added only when the source is explicitly a selected FLOWLINE/GUTTER/EP control.
+- Standard curb conversion is +0.50 for true FL/gutter/EP.
+- Catch +0.42 and spill +0.58 remain available only when the certified PDF detail clearly supports that selection.
+- HP and LP holds still override surface interpolation and are never averaged through.

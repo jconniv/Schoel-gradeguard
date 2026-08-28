@@ -1,0 +1,19 @@
+Schoel GradeGuard v8.4.3 Patch Notes
+
+Purpose:
+- Remove the manual QA checklist requirement.
+- Keep QA/QC automatic inside the program and reports.
+
+Changes:
+1. Replaced the visible manual QA checklist with an Automatic QA/QC information panel.
+2. Generate no longer stops because checkboxes were not manually checked.
+3. Civil PDF is still required for BC generation.
+4. PDF callouts/details still control over CAD/DXF.
+5. Catch curb remains +0.42 ft and spill curb remains +0.58 ft.
+6. BC station interpolation from v8.4.1 remains active.
+7. HP/LP protection from v8.4.2 remains active.
+8. Unsupported points still export as 0.000 and are flagged in the review/source report.
+9. Debug/report output now records v8.4.3 automatic QA/QC rule.
+
+Important:
+- The manual checklist was removed because the user wants GradeGuard to perform automatic QA/QC instead of requiring the drafter to check boxes.

@@ -1,0 +1,14 @@
+Schoel GradeGuard v8.5.1 Surface Mode
+
+This build changes curb grading from scattered point logic to surface-first logic.
+
+Rules added:
+1. Build a temporary proposed grading surface from 3D DXF contours when no LandXML surface is supplied.
+2. Sample normal BC points from that contour surface.
+3. Direct contour at BC holds exact contour elevation with no curb height added.
+4. PDF/manual TC/BC callouts hold first.
+5. HP and LP callouts remain hard vertical controls and are never averaged through.
+6. BC station interpolation remains as QA/fallback after the surface.
+7. Storm/low areas are respected through the contour surface and water-flow review; storm inverts are not used as BC unless a top/grate/curb callout verifies them.
+
+This specifically addresses points like 6044, 6004, 6016, and 6017 where the previous builds were pulling from station/profile logic instead of the proposed grading surface.
