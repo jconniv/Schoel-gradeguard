@@ -4,7 +4,7 @@ Schoel GradeGuard is an internal survey-office application for producing and rev
 
 ## Status
 
-- Current version: 9.0.5
+- Current version: 9.1.0
 - Status: pre-release validation
 - Intended users: Schoel Engineering survey-office personnel
 - Maintainer: Joseph Conniv
@@ -25,6 +25,8 @@ For a signed release, run `Build_Signed_MSI.ps1`. It builds the EXE and MSI, sig
 ## Launch from Civil 3D or AutoCAD
 
 The MSI installs `GradeGuard.lsp` with the application. Load it with `APPLOAD`, add it to the Startup Suite, and run `SCHOELGRADEGUARD`. See `CAD_Ribbon_Install_Readme.txt` for the ribbon macro and diagnostic commands. The existing GradeGuard import LISP files remain available for importing reviewed output.
+
+Before BC generation, GradeGuard presents a preflight summary of the selected CAD, certified PDF, surface source, units workflow, curb conversion, geometry selections, and output folder. Uncertain or unsafe points are omitted from the stake-ready CSV and written to `GradeGuard_DO_NOT_STAKE.csv` for office review.
 
 ## Test
 

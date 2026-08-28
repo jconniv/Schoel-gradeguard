@@ -29,7 +29,7 @@ except Exception:
     fitz = None
 
 Point2 = Tuple[float, float]
-APP_VERSION = "9.0.5"
+APP_VERSION = "9.1.0"
 
 @dataclass
 class GenPoint:
@@ -4476,13 +4476,13 @@ def apply_contour_surface_mode_v851(points: List[GenPoint], contour_tin: Optiona
     return changed
 
 
-def sanitize_field_elevations(points: List[GenPoint], unknown_to_zero: bool = True, max_local_jump: float = 8.0) -> int:
-    """Zero out unsafe or unknown staking elevations before field CSV export.
+def sanitize_field_elevations(points: List[GenPoint], unknown_to_zero: bool = False, max_local_jump: float = 8.0) -> int:
+    """Withhold unsafe or unknown elevations before field CSV export.
 
     v8.3 field-safety rule:
     GradeGuard must not export a believable elevation unless the source is strong enough
-    for field staking. Unknown or less-than-high-confidence points are exported as
-    0.000 so the crew does not accidentally build from a wrong elevation.
+    for field staking. Unknown or less-than-high-confidence points are withheld
+    from the stake-ready CSV so they cannot be mistaken for real 0.000 elevations.
 
     Accepted as high-confidence:
     - held/manual CAD/PDF callouts at the leader/arrow point,
@@ -4491,7 +4491,7 @@ def sanitize_field_elevations(points: List[GenPoint], unknown_to_zero: bool = Tr
     - LandXML/design surface,
     - clean interpolation/proration between contour controls after converting FL/gutter controls to BC-equivalent elevations.
 
-    Zeroed for review:
+    Withheld for review:
     - no source,
     - obvious project outlier,
     - nearby contour fallback,
@@ -4505,14 +4505,14 @@ def sanitize_field_elevations(points: List[GenPoint], unknown_to_zero: bool = Tr
     if not vals:
         for p in points:
             p.elevation = 0.0 if unknown_to_zero else None
-            p.confidence = (p.confidence + "; ZEROED_UNKNOWN").strip("; ") if p.confidence else "ZEROED_UNKNOWN"
-            p.issue = (p.issue + " " if p.issue else "") + "No reliable elevation source found. Field elevation set to 0.000 for safety."
+            p.confidence = (p.confidence + "; WITHHELD_UNKNOWN").strip("; ") if p.confidence else "WITHHELD_UNKNOWN"
+            p.issue = (p.issue + " " if p.issue else "") + "No reliable elevation source found. Point withheld from stake-ready export."
         return len(points)
 
     vals_sorted = sorted(vals)
     med = vals_sorted[len(vals_sorted)//2]
     hard_outlier = max(50.0, max_local_jump * 5.0)
-    zeroed = 0
+    withheld = 0
 
     def strong_enough(gp: GenPoint) -> Tuple[bool, str]:
         conf = (gp.confidence or "").upper()
@@ -4606,12 +4606,24 @@ def sanitize_field_elevations(points: List[GenPoint], unknown_to_zero: bool = Tr
                     reason = why
         if reason:
             gp.elevation = 0.0 if unknown_to_zero else None
-            gp.confidence = (gp.confidence + "; ZEROED_REVIEW").strip("; ") if gp.confidence else "ZEROED_REVIEW"
-            gp.issue = (gp.issue + " " if gp.issue else "") + reason + " Field elevation set to 0.000 for safety; review before staking."
-            zeroed += 1
-    return zeroed
+            gp.confidence = (gp.confidence + "; WITHHELD_REVIEW").strip("; ") if gp.confidence else "WITHHELD_REVIEW"
+            gp.issue = (gp.issue + " " if gp.issue else "") + reason + " Point withheld from stake-ready export; review before staking."
+            withheld += 1
+    return withheld
 
-def write_csv(points: List[GenPoint], out_path: str):
+def stake_ready_points(points: List[GenPoint]) -> List[GenPoint]:
+    """Return points carrying a non-zero numeric elevation approved by the sanitizer."""
+    ready = []
+    for point in points:
+        try:
+            if point.elevation is not None and abs(float(point.elevation)) > 1e-9:
+                ready.append(point)
+        except (TypeError, ValueError):
+            continue
+    return ready
+
+
+def write_csv(points: List[GenPoint], out_path: str) -> int:
     """Write field import CSV with NO header row.
 
     CAD/data collector import expects raw P,N,E,Z,D rows.  The detailed debug
@@ -4619,9 +4631,23 @@ def write_csv(points: List[GenPoint], out_path: str):
     """
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        for p in points:
-            elev = "0.000" if p.elevation is None else f"{p.elevation:.3f}"
+        ready = stake_ready_points(points)
+        for p in ready:
+            elev = f"{float(p.elevation):.3f}"
             w.writerow([p.point, f"{p.northing:.3f}", f"{p.easting:.3f}", elev, p.desc or "BC"])
+    return len(ready)
+
+
+def write_do_not_stake_csv(points: List[GenPoint], out_path: str) -> int:
+    """Write withheld points to a labeled office-review file, not a raw field CSV."""
+    ready_ids = {id(p) for p in stake_ready_points(points)}
+    withheld = [p for p in points if id(p) not in ready_ids]
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["DO_NOT_STAKE", "Point", "Northing", "Easting", "Description", "Confidence", "Source", "Blocking_Reason"])
+        for p in withheld:
+            w.writerow(["DO_NOT_STAKE", p.point, f"{p.northing:.3f}", f"{p.easting:.3f}", p.desc or "BC", p.confidence, p.source, p.issue])
+    return len(withheld)
 
 
 def write_debug_csv(points: List[GenPoint], out_path: str):
@@ -4629,7 +4655,7 @@ def write_debug_csv(points: List[GenPoint], out_path: str):
         w = csv.writer(f)
         w.writerow(["Point", "Northing", "Easting", "Elevation", "Description", "Source", "Confidence", "Issue"])
         for p in points:
-            elev = "0.000" if p.elevation is None else f"{p.elevation:.3f}"
+            elev = "" if p.elevation is None else f"{p.elevation:.3f}"
             w.writerow([p.point, f"{p.northing:.3f}", f"{p.easting:.3f}", elev, p.desc or "BC", p.source, p.confidence, p.issue])
 
 
@@ -4658,7 +4684,7 @@ def gg_v9_status_for_point(p: GenPoint) -> Tuple[str, str]:
         return "RED", "0.000 elevation requires review."
 
     red_terms = [
-        "ZEROED_REVIEW", "UNSUPPORTED", "MISSING", "NO RELIABLE", "DO NOT STAKE",
+        "ZEROED_REVIEW", "WITHHELD_REVIEW", "WITHHELD_UNKNOWN", "UNSUPPORTED", "MISSING", "NO RELIABLE", "DO NOT STAKE",
         "FIELD ELEVATION SET TO 0.000", "NOT BRACKETED", "COULD NOT"
     ]
     if any(t in txt for t in red_terms):
@@ -4694,7 +4720,7 @@ def write_confidence_summary_csv(points: List[GenPoint], out_path: str) -> Dict[
         for p in points:
             status, reason = gg_v9_status_for_point(p)
             counts[status] = counts.get(status, 0) + 1
-            elev = "0.000" if p.elevation is None else f"{p.elevation:.3f}"
+            elev = "" if p.elevation is None else f"{p.elevation:.3f}"
             w.writerow([p.point, f"{p.northing:.3f}", f"{p.easting:.3f}", elev, p.desc or "BC", status, reason, p.confidence, p.source, p.issue])
     return counts
 
@@ -4740,7 +4766,7 @@ def write_surface_conflict_report_csv(points: List[GenPoint], out_path: str, max
     return {"surface_conflict_rows": len(rows), "surface_conflict_red": sum(1 for r in rows if r[6] == "RED"), "surface_conflict_yellow": sum(1 for r in rows if r[6] == "YELLOW")}
 
 
-def write_v9_package_manifest(out_dir: str, csv_path: str, debug_csv_path: str, report_path: str, confidence_path: str, conflict_path: str, flow_pdf_path: str, dxf_stats: Dict[str, Any]) -> str:
+def write_v9_package_manifest(out_dir: str, csv_path: str, debug_csv_path: str, report_path: str, confidence_path: str, conflict_path: str, flow_pdf_path: str, dxf_stats: Dict[str, Any], do_not_stake_path: str = "") -> str:
     manifest_path = os.path.join(out_dir, "GradeGuard_v9_Survey_Package_Manifest.txt")
     with open(manifest_path, "w", encoding="utf-8") as f:
         f.write("Schoel GradeGuard v9.0 Survey Package Mode\n")
@@ -4761,6 +4787,7 @@ def write_v9_package_manifest(out_dir: str, csv_path: str, debug_csv_path: str, 
             ("Source/debug CSV", debug_csv_path),
             ("HTML office QA report", report_path),
             ("Confidence summary CSV", confidence_path),
+            ("DO NOT STAKE office-review CSV", do_not_stake_path),
             ("Surface conflict report CSV", conflict_path),
             ("Water flow PDF", flow_pdf_path or ""),
         ]:
@@ -4944,13 +4971,13 @@ def write_report(points: List[GenPoint], layers: List[str], pdf_scan: Dict[str, 
         f.write(f"<p class='bad'>Points needing review: {len(issues)}</p>")
         f.write("<table><tr><th>Point</th><th>N</th><th>E</th><th>Elev</th><th>Confidence</th><th>Issue</th><th>Source</th></tr>")
         for p in issues[:800]:
-            elev = "0.000" if p.elevation is None else f"{p.elevation:.3f}"
+            elev = "WITHHELD" if p.elevation is None else f"{p.elevation:.3f}"
             f.write(f"<tr><td>{p.point}</td><td>{p.northing:.3f}</td><td>{p.easting:.3f}</td><td>{elev}</td><td>{p.confidence}</td><td>{p.issue}</td><td>{p.source}</td></tr>")
         f.write("</table>")
         f.write("<h2>First 100 Generated Points</h2>")
         f.write("<table><tr><th>Point</th><th>N</th><th>E</th><th>Elev</th><th>Source</th></tr>")
         for p in points[:100]:
-            elev = "0.000" if p.elevation is None else f"{p.elevation:.3f}"
+            elev = "WITHHELD" if p.elevation is None else f"{p.elevation:.3f}"
             f.write(f"<tr><td>{p.point}</td><td>{p.northing:.3f}</td><td>{p.easting:.3f}</td><td>{elev}</td><td>{p.source}</td></tr>")
         f.write("</table>")
         f.write("<h2>PDF Scan</h2>")
@@ -5174,7 +5201,7 @@ def run_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, sp
     dxf_stats["pdf_verified_curb_height_ft"] = float(verified_height)
     dxf_stats["pdf_curb_height_verified"] = bool(height_verified)
     dxf_stats["pdf_curb_height_note"] = height_note
-    dxf_stats["v8_4_4_auto_qa_rule"] = "Automatic QA/QC active: final signed civil PDF is required; PDF controls over CAD/DXF; PDF callouts use leader/arrow/tick endpoint when readable, not the text box; standard curb +0.50 unless the certified PDF detail specifically supports catch +0.42, spill +0.58, or custom height; HP/LP points are protected; unsupported 0.000 elevations are flagged for review."
+    dxf_stats["v8_4_4_auto_qa_rule"] = "Automatic QA/QC active: final signed civil PDF is required; PDF controls over CAD/DXF; PDF callouts use leader/arrow/tick endpoint when readable, not the text box; standard curb +0.50 unless the certified PDF detail specifically supports catch +0.42, spill +0.58, or custom height; HP/LP points are protected; unsupported elevations are withheld for review."
     raw_points, pcpt_added = add_curb_geometry_control_points(raw_points, tolerance=0.05)
     dxf_stats["pc_pt_geometry_points_added"] = pcpt_added
     raw_points, contour_crossings_added, fl_crossings_added = add_contour_crossing_bc_points(raw_points, segments, tolerance=0.35)
@@ -5304,10 +5331,10 @@ def run_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, sp
     normalize_high_low_descriptions(gen)
     hp_lp_cluster_holds_v857 = protect_close_hp_lp_clusters_v857(gen, cluster_tol=1.25, max_allowed_delta=0.20)
     dxf_stats["v8_5_7_hp_lp_cluster_holds"] = hp_lp_cluster_holds_v857
-    dxf_stats["v8_4_8_hp_lp_hold_rule"] = "HP/LP plan callouts are hard vertical controls. Held HP/LP elevations are hard-locked to the callout value and are never averaged, interpolated through, overwritten by station contour profile correction, or zeroed by the sanitizer. HP/LP points with no trusted callout elevation remain 0.000 and flagged for review."
+    dxf_stats["v8_4_8_hp_lp_hold_rule"] = "HP/LP plan callouts are hard vertical controls. Held HP/LP elevations are hard-locked to the callout value and are never averaged, interpolated through, overwritten by station contour profile correction, or withheld by the sanitizer. HP/LP points with no trusted callout elevation are withheld and flagged for review."
     dxf_stats["v8_4_2_hp_lp_hold_rule"] = "HP/LP plan callouts are hard controls. Existing HP/LP elevations are never averaged; zero HP/LP points remain review items instead of being smoothed through."
-    zeroed_review_count = sanitize_field_elevations(gen, unknown_to_zero=True)
-    dxf_stats["field_elevations_zeroed_for_review"] = zeroed_review_count
+    withheld_review_count = sanitize_field_elevations(gen, unknown_to_zero=False)
+    dxf_stats["field_points_withheld_for_review"] = withheld_review_count
     hp_lp_relocked_after_sanitize = hard_lock_hp_lp_callout_elevations(gen, primary_labels, tolerance=2.50)
     dxf_stats["v8_4_8_hp_lp_relocked_after_sanitize"] = hp_lp_relocked_after_sanitize
     normalize_high_low_descriptions(gen)
@@ -5317,7 +5344,11 @@ def run_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, sp
     report_path = os.path.join(out_dir, "GradeGuard_Generate_Report.html")
     confidence_path = os.path.join(out_dir, "GradeGuard_Confidence_Summary.csv")
     conflict_path = os.path.join(out_dir, "GradeGuard_Surface_Conflict_Report.csv")
-    write_csv(gen, csv_path)
+    do_not_stake_path = os.path.join(out_dir, "GradeGuard_DO_NOT_STAKE.csv")
+    stake_ready_count = write_csv(gen, csv_path)
+    do_not_stake_count = write_do_not_stake_csv(gen, do_not_stake_path)
+    dxf_stats["stake_ready_points_exported"] = stake_ready_count
+    dxf_stats["do_not_stake_points_withheld"] = do_not_stake_count
     write_debug_csv(gen, debug_csv_path)
     confidence_counts = write_confidence_summary_csv(gen, confidence_path)
     conflict_counts = write_surface_conflict_report_csv(gen, conflict_path, max_normal_jump=0.35)
@@ -5351,10 +5382,10 @@ def run_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, sp
     else:
         dxf_stats["offset_points_created"] = 0
 
-    manifest_path = write_v9_package_manifest(out_dir, csv_path, debug_csv_path, report_path, confidence_path, conflict_path, created_flow_pdf or "", dxf_stats)
+    manifest_path = write_v9_package_manifest(out_dir, csv_path, debug_csv_path, report_path, confidence_path, conflict_path, created_flow_pdf or "", dxf_stats, do_not_stake_path)
     dxf_stats["v9_0_package_manifest"] = manifest_path
     write_report(gen, layers, pdf_scan, dxf_stats, report_path)
-    return csv_path, debug_csv_path, report_path, len(gen), len([p for p in gen if p.issue]), len([p for p in gen if p.elevation is not None])
+    return csv_path, debug_csv_path, report_path, len(gen), len([p for p in gen if p.issue]), stake_ready_count
 
 
 
@@ -6265,7 +6296,7 @@ class GradeGuardApp(tk.Tk):
         qa.pack(fill="x", pady=(6, 6))
         ttk.Label(
             qa,
-            text="No manual QA checklist required. GradeGuard automatically requires the civil PDF, keeps PDF callouts/details over CAD/DXF, checks selected BC/FL geometry, builds station-based contour controls, protects HP/LP break points, flags unsupported 0.000 elevations, and writes the QA/source report.",
+            text="Automatic QA/QC requires the civil PDF, keeps PDF callouts/details over CAD/DXF, checks selected BC/FL geometry, builds station-based contour controls, protects HP/LP break points, withholds unsupported elevations, and presents a preflight review before generation.",
             font=("Arial", 10, "italic"),
             wraplength=1080,
         ).grid(row=0, column=0, sticky="w")
@@ -6381,6 +6412,28 @@ class GradeGuardApp(tk.Tk):
         but it no longer asks the user to manually check a checklist before running.
         """
         return []
+
+    def _confirm_preflight(self, cad: str, pdf: str, surface: str, out: str, curb_height: float, curb_note: str) -> bool:
+        selected_bc = os.path.exists(self.selected_curb_path)
+        selected_fl = os.path.exists(self.selected_flowline_path)
+        summary = [
+            f"GradeGuard version: {APP_VERSION}",
+            f"CAD/DXF: {cad}",
+            f"Certified civil PDF: {pdf}",
+            f"LandXML/XML surface: {surface or 'NONE - DXF contours/surface fallback'}",
+            f"Output folder: {out}",
+            "Units: U.S. survey feet workflow (confirm drawing and source files)",
+            f"Curb conversion: {curb_height:.3f} ft",
+            f"Picked true BC geometry: {'YES' if selected_bc else 'NO - automatic layer detection only'}",
+            f"Picked flowline/gutter geometry: {'YES' if selected_fl else 'NO'}",
+            "BOC rule: bare BOC is ambiguous and remains review-only.",
+            "Unsafe points will be omitted from the stake-ready CSV and listed in GradeGuard_DO_NOT_STAKE.csv.",
+            "",
+            curb_note,
+            "",
+            "Continue only after confirming these inputs against the certified plans.",
+        ]
+        return messagebox.askyesno("GradeGuard Preflight Review", "\n".join(summary), icon="warning")
 
     def _selected_curb_height_and_note(self) -> Tuple[float, bool, str]:
         v = self.curb_type_var.get()
@@ -7681,6 +7734,9 @@ class GradeGuardApp(tk.Tk):
             self.log_msg("Automatic QA/QC active: PDF required, PDF controls over CAD/DXF, HP/LP protected, and unsupported elevations flagged in the review report.")
             selected_curb_height, selected_curb_height_verified, selected_curb_height_note = self._selected_curb_height_and_note()
             self.height_var.set(f"{selected_curb_height:.2f}")
+            if not self._confirm_preflight(cad, pdf, surface, out, selected_curb_height, selected_curb_height_note):
+                self.log_msg("Generation cancelled during preflight review.")
+                return
             self.log_msg(selected_curb_height_note)
             self.log_msg("DXF is fixed. Surface/contour interpretation: " + self.surface_interpret_var.get())
             self.log_msg("Picked BC file: " + str(self.selected_curb_path))
@@ -7754,7 +7810,7 @@ class GradeGuardApp(tk.Tk):
             flow_pdf_path = os.path.join(out, "GradeGuard_BC_Water_Flow_Map.pdf")
             if os.path.exists(flow_pdf_path):
                 self.log_msg(f"Water flow PDF: {flow_pdf_path}")
-            messagebox.showinfo("Done", f"Generated {total} BC points.\nPoints with elevations: {assigned}\nReview items: {issues}\n\nCreated v9.0 Survey Package outputs in the same folder:\n- Confidence Summary\n- Surface Conflict Report\n- Water Flow Map\n- Office QA Report\n\n{csv_path}")
+            messagebox.showinfo("Done", f"Generated {total} BC points.\nStake-ready points exported: {assigned}\nReview items: {issues}\n\nUnsafe points were withheld from the field CSV and written to GradeGuard_DO_NOT_STAKE.csv.\n\nCreated Survey Package outputs in the same folder:\n- Confidence Summary\n- Surface Conflict Report\n- Water Flow Map\n- Office QA Report\n\n{csv_path}")
         except Exception as e:
             self.log_msg("ERROR:")
             self.log_msg(str(e))

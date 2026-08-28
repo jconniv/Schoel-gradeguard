@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [9.1.0] - 2026-08-28
+
+### Added
+
+- Added an explicit preflight confirmation summarizing CAD, certified PDF, surface source, U.S. survey-foot workflow, curb conversion, selected geometry, and output location.
+- Added `GradeGuard_DO_NOT_STAKE.csv` as a clearly labeled office-review report for withheld points.
+- Added regression tests for stake-ready filtering and withheld-point reporting.
+
+### Changed
+
+- Unsafe, missing, zero, and review-only elevations are now omitted from the raw stake-ready CSV instead of being exported as numeric `0.000` elevations.
+- Debug and confidence reports now leave withheld elevations blank so they cannot resemble measured or designed zero elevations.
+
+### Survey/data impact
+
+- No coordinate, surface, curb, HP/LP, interpolation, or elevation formula changed. The export safety gate changed: points without an approved elevation source are withheld from field import and require office review.
+
 ## [9.0.5] - 2026-08-28
 
 ### Added
