@@ -28,13 +28,19 @@
 
     <ComponentGroup Id="AppFiles" Directory="APPFOLDER">
       <Component Guid="A0FB879D-A6A1-4607-9B74-E08AA62206A7">
-        <File Id="MainExe" Source="$(var.MainExePath)" KeyPath="yes" />
+        <File Id="MainExe" Source="$(var.MainExePath)" Name="SchoelGradeGuard.exe" KeyPath="yes" />
+      </Component>
+      <Component Guid="B7C28F47-96B1-48C8-B18D-520D3B98EC07">
+        <File Source="GradeGuard.lsp" KeyPath="yes" />
       </Component>
       <Component Guid="F418A389-3BE9-49EC-9090-72694E00122F">
         <File Source="GradeGuard_v9_Civil3D_Import.lsp" KeyPath="yes" />
       </Component>
       <Component Guid="880E21C5-A7D7-4886-9AE8-F19D879646BC">
         <File Source="GradeGuard_Import_BC_Points.lsp" KeyPath="yes" />
+      </Component>
+      <Component Guid="9C5D163C-4446-4A89-B275-E47D8BB2C294">
+        <File Source="CAD_Ribbon_Install_Readme.txt" KeyPath="yes" />
       </Component>
     </ComponentGroup>
 

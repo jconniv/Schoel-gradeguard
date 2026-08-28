@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [9.0.5] - 2026-08-28
+
+### Added
+
+- Added `GradeGuard.lsp` so GradeGuard can be launched directly from Civil 3D or AutoCAD with `SCHOELGRADEGUARD`.
+- Added commands for selecting and testing a nonstandard GradeGuard installation path.
+- Added CAD startup and ribbon instructions and included all three GradeGuard LISP files in the MSI.
+
+### Changed
+
+- The MSI now installs the versioned build as the stable `SchoelGradeGuard.exe` filename used by the CAD launcher.
+
+### Survey/data impact
+
+- CAD launch and packaging only. No calculations, coordinates, elevations, units, datums, precision, imports, exports, or QA rules changed.
+
 ## [9.0.4] - 2026-08-28
 
 ### Added
