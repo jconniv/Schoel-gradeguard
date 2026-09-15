@@ -1,7 +1,14 @@
-name: SharePoint Mirror Pilot
+name: SharePoint Mirror
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
+
+concurrency:
+  group: sharepoint-mirror-${{ github.repository }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -28,4 +35,3 @@ jobs:
           tenant_id: ${{ secrets.SHAREPOINT_TENANT_ID }}
           client_id: ${{ secrets.SHAREPOINT_CLIENT_ID }}
           client_secret: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
-
