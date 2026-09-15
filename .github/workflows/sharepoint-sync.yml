@@ -1,0 +1,31 @@
+name: SharePoint Mirror Pilot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Mirror clean source to SharePoint
+        uses: MarkusMcNugen/SharePoint-Mirror-Sync@4c39894408ac51695559fd93cfb53464578aabbc # v1.0.0
+        with:
+          file_path: "**/*"
+          file_path_recursive_match: true
+          exclude_patterns: ".git,.vs,bin,obj,artifacts,dist,build,release_dist,release_build,installer_out,node_modules,__pycache__,.pytest_cache,.mypy_cache,.venv,*.db,*.sqlite,*.sqlite3,*.pfx,*.key,*.pem,.env,.env.*,secrets.json,update_config.json,appsettings.Development.json,*.user,*.tmp,*.bak,*.log,Thumbs.db,.DS_Store"
+          convert_md_to_html: false
+          sync_delete: false
+          max_upload_workers: 2
+          host_name: "schoel.sharepoint.com"
+          site_name: "devteam"
+          upload_path: ${{ vars.SHAREPOINT_UPLOAD_PATH }}
+          tenant_id: ${{ secrets.SHAREPOINT_TENANT_ID }}
+          client_id: ${{ secrets.SHAREPOINT_CLIENT_ID }}
+          client_secret: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+
