@@ -4,7 +4,7 @@ Schoel GradeGuard is an internal survey-office application for producing and rev
 
 ## Status
 
-- Current version: 9.1.0
+- Current version: 9.1.1
 - Status: pre-release validation
 - Intended users: Schoel Engineering survey-office personnel
 - Maintainer: Joseph Conniv

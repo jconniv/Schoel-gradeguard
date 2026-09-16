@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [9.1.1] - 2026-09-16
+
+### Fixed
+
+- Index curb endpoints to avoid all-pairs connectivity and ordering scans while preserving original distance and tie rules.
+- Read PDF grading-sheet vectors once per label extraction and reuse the loaded DXF for layer detection.
+
+### Survey/data impact
+
+- Performance only; retains 9.1.0 preflight, HP/LP trust checks, ambiguous BOC handling, and withholding unsafe staking points. No elevation formula, unit, datum, tolerance, precision, or export rule changed.
+
 ## [9.1.0] - 2026-08-28
 
 ### Added

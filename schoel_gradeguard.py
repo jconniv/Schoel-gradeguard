@@ -29,7 +29,7 @@ except Exception:
     fitz = None
 
 Point2 = Tuple[float, float]
-APP_VERSION = "9.1.0"
+APP_VERSION = "9.1.1"
 
 @dataclass
 class GenPoint:
@@ -1091,10 +1091,10 @@ def should_use_curb_layer(layer: str, keywords: List[str]) -> Tuple[bool, str, s
     return False, conf, meaning
 
 
-def detect_curb_layers(dxf_path: str, keywords: Optional[List[str]] = None) -> List[Dict[str, str]]:
+def detect_curb_layers(dxf_path: str, keywords: Optional[List[str]] = None, document=None) -> List[Dict[str, str]]:
     if ezdxf is None:
         raise RuntimeError("ezdxf is not installed. Double click install_requirements.bat first.")
-    doc = ezdxf.readfile(dxf_path)
+    doc = document if document is not None else ezdxf.readfile(dxf_path)
     msp = doc.modelspace()
     layers = sorted(set(entity_layer(e) for e in msp if entity_layer(e)))
     out = []
@@ -1199,7 +1199,7 @@ def load_dxf_geometry_and_elevations(dxf_path: str, curb_keywords: List[str], el
     stats = {"cad_grade_labels": 0, "elevation_segments": 0, "elevation_layers": {}, "all_layers": [], "curb_layer_candidates": []}
     all_layers = sorted(set(entity_layer(e) for e in msp))
     stats["all_layers"] = all_layers
-    stats["curb_layer_candidates"] = detect_curb_layers(dxf_path, curb_keywords)
+    stats["curb_layer_candidates"] = detect_curb_layers(dxf_path, curb_keywords, document=doc)
 
     for ent in msp:
         layer = entity_layer(ent)
@@ -1997,7 +1997,7 @@ def _point_to_pdf_bbox_distance(pt: Point2, bbox) -> float:
     return math.hypot(dx, dy)
 
 
-def _pdf_leader_tip_for_text_block(page, bbox, max_leader_dist: float = 95.0) -> Optional[Point2]:
+def _pdf_leader_tip_for_text_block(page, bbox, max_leader_dist: float = 95.0, line_segments=None) -> Optional[Point2]:
     """Find the probable arrow/tick endpoint for a PDF grade callout text block.
 
     Rule: the text box does not hold.  The arrow, leader, or tick endpoint holds.
@@ -2005,7 +2005,7 @@ def _pdf_leader_tip_for_text_block(page, bbox, max_leader_dist: float = 95.0) ->
     away from the text block center, because CAD/PDF leaders generally run from
     the label toward the physical control point.
     """
-    segs = _pdf_page_line_segments(page)
+    segs = _pdf_page_line_segments(page) if line_segments is None else line_segments
     if not segs:
         return None
     x0, y0, x1, y1 = [float(v) for v in bbox]
@@ -2148,6 +2148,7 @@ def extract_pdf_spot_labels(pdf_path: str, default_curb_height: float, cad_refer
     if model is None:
         return labels, info
     page = doc[pi]
+    line_segments = None
     for b in page.get_text("dict").get("blocks", []):
         if b.get("type") != 0:
             continue
@@ -2159,7 +2160,9 @@ def extract_pdf_spot_labels(pdf_path: str, default_curb_height: float, cad_refer
         if "FINISHED GRADE" in raw.upper() and "TOP OF CURB" in raw.upper():
             continue
         x0, y0, x1, y1 = b["bbox"]
-        tip = _pdf_leader_tip_for_text_block(page, b["bbox"])
+        if line_segments is None:
+            line_segments = _pdf_page_line_segments(page)
+        tip = _pdf_leader_tip_for_text_block(page, b["bbox"], line_segments=line_segments)
         if tip is None:
             # Last resort only.  The review/source text will show that this came from the text box.
             px, py = (x0 + x1) / 2.0, (y0 + y1) / 2.0
@@ -3100,6 +3103,25 @@ def _segments_touch(a: CurbSegment, b: CurbSegment, tol: float) -> bool:
     )
 
 
+def _curb_endpoint_index(segments, tolerance):
+    cell = max(abs(float(tolerance)), 0.01)
+    index = {}
+    for i, seg in enumerate(segments):
+        for x, y in (seg.a, seg.b):
+            index.setdefault((math.floor(x / cell), math.floor(y / cell)), set()).add(i)
+    return index, cell
+
+
+def _curb_endpoint_candidates(index, cell, endpoints, tolerance):
+    candidates = set()
+    for x, y in endpoints:
+        for ix in range(math.floor((x - tolerance) / cell), math.floor((x + tolerance) / cell) + 1):
+            for iy in range(math.floor((y - tolerance) / cell), math.floor((y + tolerance) / cell) + 1):
+                candidates.update(index.get((ix, iy), ()))
+    # Original order preserves equal-distance tie decisions in station ordering.
+    return sorted(candidates)
+
+
 def _order_connected_curb_run(run: List[CurbSegment], start_i: int = 0, tol: float = 1.50) -> List[CurbSegment]:
     """Order a connected set of curb segments into a station chain.
 
@@ -3110,7 +3132,8 @@ def _order_connected_curb_run(run: List[CurbSegment], start_i: int = 0, tol: flo
     if len(run) <= 1:
         return run[:]
 
-    remaining = run[:]
+    endpoint_index, endpoint_cell = _curb_endpoint_index(run, tol + 1e-9)
+    remaining = dict(enumerate(run))
     ordered = [remaining.pop(start_i if 0 <= start_i < len(remaining) else 0)]
 
     changed = True
@@ -3123,7 +3146,11 @@ def _order_connected_curb_run(run: List[CurbSegment], start_i: int = 0, tol: flo
         best_where = None
         best_rev = False
         best_d = tol + 1e-9
-        for i, seg in enumerate(remaining):
+        candidates = _curb_endpoint_candidates(endpoint_index, endpoint_cell, (head.a, tail.b), tol + 1e-9)
+        for i in candidates:
+            if i not in remaining:
+                continue
+            seg = remaining[i]
             tests = [
                 (dist(seg.b, head.a), 'front', False),
                 (dist(seg.a, head.a), 'front', True),
@@ -3147,7 +3174,7 @@ def _order_connected_curb_run(run: List[CurbSegment], start_i: int = 0, tol: flo
     # If branches or gaps remain, append by nearest endpoint so stationing still has a stable order.
     while remaining:
         tail = ordered[-1]
-        best = min(range(len(remaining)), key=lambda i: min(dist(tail.b, remaining[i].a), dist(tail.b, remaining[i].b)))
+        best = min(remaining, key=lambda i: min(dist(tail.b, remaining[i].a), dist(tail.b, remaining[i].b)))
         seg = remaining.pop(best)
         if dist(tail.b, seg.b) < dist(tail.b, seg.a):
             seg = CurbSegment(seg.b, seg.a, seg.layer)
@@ -3171,11 +3198,14 @@ def _local_curb_segments_for_point(p: Point2, max_endpoint_gap: float = 1.50) ->
     if start_i is None:
         return []
 
+    endpoint_index, endpoint_cell = _curb_endpoint_index(CURB_SEGMENTS, max_endpoint_gap)
     visited = {start_i}
     stack = [start_i]
     while stack:
         i = stack.pop()
-        for j, seg in enumerate(CURB_SEGMENTS):
+        candidates = _curb_endpoint_candidates(endpoint_index, endpoint_cell, (CURB_SEGMENTS[i].a, CURB_SEGMENTS[i].b), max_endpoint_gap)
+        for j in candidates:
+            seg = CURB_SEGMENTS[j]
             if j in visited:
                 continue
             if _segments_touch(CURB_SEGMENTS[i], seg, max_endpoint_gap):
