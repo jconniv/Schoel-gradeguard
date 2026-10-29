@@ -1,186 +1,91 @@
-; GradeGuard v9 Civil 3D Import
-; Commands:
-;   GGIMPORTV9       Imports GradeGuard Confidence Summary CSV with symbols colored by QA status.
-;   GGIMPORTV93D     Same, plus draws a 3D polyline through imported points.
-;
-; Best input:
-;   GradeGuard_Confidence_Summary.csv
-;
-; Also works with:
-;   Generated_BC_Points.csv
-;
-; Layers:
-;   GG_GREEN_READY
-;   GG_YELLOW_REVIEW
-;   GG_RED_DONT_STAKE
-;   GG_BC_TEXT
-;   GG_BC_ELEV
-;   GG_BC_3D_POLY
+; GradeGuard 9.3.1 - validated point import, no inferred line connectivity.
+; Accepts headerless P,N,E,Z,D or GradeGuard Confidence Summary CSV.
+; Quoted commas and escaped quotes are supported. Malformed/multiline rows,
+; blank or zero elevations, and RED/unknown status rows are skipped.
+; 3D command aliases import points only: CSV row order is not topology.
+(vl-load-com)
 
-(defun gg:split (s delim / pos out token)
-  (setq out '())
-  (while (setq pos (vl-string-search delim s))
-    (setq token (substr s 1 pos))
-    (setq out (append out (list token)))
-    (setq s (substr s (+ pos 2)))
-  )
-  (append out (list s))
-)
+(defun gg931:csv (s / i n ch token fields quoted bad)
+  (setq i 1 n (strlen s) token "" fields '() quoted nil bad nil)
+  (while (<= i n)
+    (setq ch (substr s i 1))
+    (cond
+      ((= ch "\"")
+       (if (and quoted (< i n) (= (substr s (+ i 1) 1) "\""))
+         (progn (setq token (strcat token "\"")) (setq i (+ i 1)))
+         (if (or quoted (= token ""))
+           (setq quoted (not quoted))
+           (setq bad T))))
+      ((and (= ch ",") (not quoted))
+       (setq fields (cons token fields) token ""))
+      (T (setq token (strcat token ch))))
+    (setq i (+ i 1)))
+  (if (or quoted bad) nil (reverse (cons token fields))))
 
-(defun gg:trim (s)
-  (vl-string-trim " \t\r\n\"" s)
-)
+(defun gg931:number (s / i ch dots digits ok)
+  (setq s (vl-string-trim " \t\r\n" s) i 1 dots 0 digits 0 ok T)
+  (while (<= i (strlen s))
+    (setq ch (substr s i 1))
+    (cond
+      ((and (= i 1) (member ch '("+" "-"))))
+      ((= ch ".") (setq dots (+ dots 1)))
+      ((wcmatch ch "#") (setq digits (+ digits 1)))
+      (T (setq ok nil)))
+    (setq i (+ i 1)))
+  (if (and ok (> digits 0) (<= dots 1)) (distof s 2) nil))
 
-(defun gg:ensure-layer (name color /)
+(defun gg931:layer (name color)
   (if (not (tblsearch "LAYER" name))
-    (command "_.-LAYER" "_M" name "_C" (itoa color) name "")
-  )
-)
+    (entmakex (list '(0 . "LAYER") '(100 . "AcDbSymbolTableRecord")
+                   '(100 . "AcDbLayerTableRecord") (cons 2 name) '(70 . 0)
+                   (cons 62 color) '(6 . "Continuous")))))
 
-(defun gg:make-text (pt h txt layer /)
-  (entmakex
-    (list
-      (cons 0 "TEXT")
-      (cons 8 layer)
-      (cons 10 pt)
-      (cons 40 h)
-      (cons 1 txt)
-      (cons 7 (getvar "TEXTSTYLE"))
-      (cons 50 0.0)
-      (cons 72 0)
-      (cons 73 0)
-    )
-  )
-)
-
-(defun gg:make-line (p1 p2 layer /)
-  (entmakex (list (cons 0 "LINE") (cons 8 layer) (cons 10 p1) (cons 11 p2)))
-)
-
-(defun gg:make-circle (pt r layer /)
-  (entmakex (list (cons 0 "CIRCLE") (cons 8 layer) (cons 10 pt) (cons 40 r)))
-)
-
-(defun gg:make-symbol-at (pt scale layer status / x y z)
-  (setq x (car pt))
-  (setq y (cadr pt))
-  (setq z (caddr pt))
-  (gg:make-circle pt (* 0.35 scale) layer)
-  (gg:make-line (list (- x (* 0.50 scale)) y z) (list (+ x (* 0.50 scale)) y z) layer)
-  (gg:make-line (list x (- y (* 0.50 scale)) z) (list x (+ y (* 0.50 scale)) z) layer)
-  (if (= status "RED")
-    (gg:make-circle pt (* 0.75 scale) layer)
-  )
-)
-
-(defun gg:status-layer (status)
-  (cond
-    ((= status "GREEN") "GG_GREEN_READY")
-    ((= status "YELLOW") "GG_YELLOW_REVIEW")
-    ((= status "RED") "GG_RED_DONT_STAKE")
-    (T "GG_YELLOW_REVIEW")
-  )
-)
-
-(defun gg:looks-like-header (line)
-  (or (vl-string-search "Point" line) (vl-string-search "QA_Status" line))
-)
-
-(defun gg:import-core (make3d / file fh line vals p n e z d status layer pt label textpt elevpt points oldcmdecho symbolScale headerMode)
-  (setq file (getfiled "Select GradeGuard CSV" "" "csv" 0))
-  (if (not file)
-    (progn (princ "\nNo file selected.") (princ))
+(defun gg931:import (/ *error* file fh row vals pn north east elev status layer pt desc count skipped)
+  (defun *error* (msg)
+    (if fh (close fh))
+    (if msg (princ (strcat "\nGradeGuard import stopped: " msg)))
+    (princ))
+  (setq file (getfiled "Select GradeGuard field CSV or confidence summary" "" "csv" 0))
+  (if file
     (progn
-      (setq oldcmdecho (getvar "CMDECHO"))
-      (setvar "CMDECHO" 0)
-
-      (gg:ensure-layer "GG_GREEN_READY" 3)
-      (gg:ensure-layer "GG_YELLOW_REVIEW" 2)
-      (gg:ensure-layer "GG_RED_DONT_STAKE" 1)
-      (gg:ensure-layer "GG_BC_TEXT" 7)
-      (gg:ensure-layer "GG_BC_ELEV" 3)
-      (gg:ensure-layer "GG_BC_3D_POLY" 4)
-
-      (setq symbolScale (getreal "\nSymbol scale <1.0>: "))
-      (if (not symbolScale) (setq symbolScale 1.0))
-
-      (setq fh (open file "r"))
-      (setq points '())
-      (setq headerMode nil)
-
-      (while (setq line (read-line fh))
-        (if (> (strlen (vl-string-trim " \t\r\n" line)) 0)
-          (progn
-            (if (gg:looks-like-header line)
-              (setq headerMode T)
-              (progn
-                (setq vals (gg:split line ","))
-                (if (>= (length vals) 5)
-                  (progn
-                    ; Confidence Summary format:
-                    ; 0 Point, 1 Northing, 2 Easting, 3 Elevation, 4 Description, 5 QA_Status
-                    ; Generated BC format:
-                    ; 0 Point, 1 Northing, 2 Easting, 3 Elevation, 4 Description
-                    (setq p (gg:trim (nth 0 vals)))
-                    (setq n (atof (gg:trim (nth 1 vals))))
-                    (setq e (atof (gg:trim (nth 2 vals))))
-                    (setq z (atof (gg:trim (nth 3 vals))))
-                    (setq d (gg:trim (nth 4 vals)))
-                    (setq status "GREEN")
-                    (if (>= (length vals) 6)
-                      (setq status (strcase (gg:trim (nth 5 vals))))
-                    )
-                    (if (not (member status '("GREEN" "YELLOW" "RED")))
-                      (setq status "YELLOW")
-                    )
-
-                    (setq layer (gg:status-layer status))
-                    (setq pt (list e n z))
-                    (setq points (append points (list pt)))
-
-                    (gg:make-symbol-at pt symbolScale layer status)
-
-                    (setq label (strcat p " " d " " status))
-                    (setq textpt (list (+ e (* 1.0 symbolScale)) (+ n (* 1.0 symbolScale)) z))
-                    (setq elevpt (list (+ e (* 1.0 symbolScale)) (- n (* 1.0 symbolScale)) z))
-
-                    (gg:make-text textpt (* 1.0 symbolScale) label "GG_BC_TEXT")
-                    (gg:make-text elevpt (* 1.0 symbolScale) (strcat "EL " (rtos z 2 3)) "GG_BC_ELEV")
-                  )
-                )
-              )
-            )
-          )
-        )
-      )
-
-      (close fh)
-
-      (if (and make3d (> (length points) 1))
+      (setq fh (open file "r") count 0 skipped 0)
+      (if fh
         (progn
-          (command "_.3DPOLY")
-          (foreach pt points (command pt))
-          (command "")
-          (if (entlast)
-            (entmod (subst (cons 8 "GG_BC_3D_POLY") (assoc 8 (entget (entlast))) (entget (entlast))))
-          )
-        )
-      )
+          (gg931:layer "GG_GREEN_READY" 3)
+          (gg931:layer "GG_YELLOW_REVIEW" 2)
+          (while (setq row (read-line fh))
+            (setq vals (gg931:csv row))
+            (cond
+              ((and vals (= (strcase (car vals)) "POINT")))
+              ((and vals (>= (length vals) 5)
+                    (setq pn (gg931:number (nth 0 vals)))
+                    (> pn 0) (= pn (fix pn))
+                    (setq north (gg931:number (nth 1 vals)))
+                    (setq east (gg931:number (nth 2 vals)))
+                    (setq elev (gg931:number (nth 3 vals)))
+                    (/= elev 0.0)
+                    (setq status (if (= (length vals) 5) "GREEN" (strcase (nth 5 vals))))
+                    (member status '("GREEN" "YELLOW")))
+               (setq layer (if (= status "GREEN") "GG_GREEN_READY" "GG_YELLOW_REVIEW")
+                     pt (list east north elev) desc (nth 4 vals))
+               (entmakex (list '(0 . "POINT") (cons 8 layer) (cons 10 pt)))
+               (entmakex (list '(0 . "TEXT") (cons 8 layer)
+                              (cons 10 (list (+ east 1.0) (+ north 1.0) elev))
+                              '(40 . 1.0) (cons 7 (getvar "TEXTSTYLE"))
+                              (cons 1 (strcat (nth 0 vals) " " desc " EL " (rtos elev 2 3)))))
+               (setq count (+ count 1)))
+              (T (setq skipped (+ skipped 1)))))
+          (close fh) (setq fh nil)
+          (princ (strcat "\nGradeGuard: " (itoa count) " points imported; " (itoa skipped)
+                         " unsafe or malformed rows skipped. No connecting lines were inferred.")))
+        (princ "\nCould not open CSV."))))
+  (princ))
 
-      (setvar "CMDECHO" oldcmdecho)
-      (princ (strcat "\nGradeGuard v9 import complete. Points imported: " (itoa (length points))))
-      (princ)
-    )
-  )
-)
-
-(defun c:GGIMPORTV9 ()
-  (gg:import-core nil)
-)
-
+(defun c:GGIMPORTV9 () (gg931:import))
+(defun c:GGIMPORTBC () (gg931:import))
 (defun c:GGIMPORTV93D ()
-  (gg:import-core T)
-)
-
-(princ "\nGradeGuard v9 Civil 3D import loaded. Run GGIMPORTV9 or GGIMPORTV93D.")
+  (princ "\nAutomatic 3D joining disabled: row order does not identify connected curb runs.")
+  (gg931:import))
+(defun c:GGIMPORTBC3D () (c:GGIMPORTV93D))
+(princ "\nGradeGuard 9.3.1 import loaded. Run GGIMPORTV9 or GGIMPORTBC. 3D aliases import points only.")
 (princ)

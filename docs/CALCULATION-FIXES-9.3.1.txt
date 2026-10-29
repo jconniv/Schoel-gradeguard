@@ -1,0 +1,149 @@
+SCHOEL GRADEGUARD 9.3.1 - CALCULATION CORRECTIONS
+October 28, 2026
+
+Result
+------
+The 78 synthetic calculation audit cases now pass (9.3.0: 40 pass, 38 fail).
+All 49 unit/regression tests pass, including the workflow and dozer opening.
+These are software checks using invented data, not field or survey certification.
+No actual project input, survey record or open Civil 3D drawing was modified.
+
+Current application: C:\SchoelTools\SchoelGradeGuard
+Executable: dist\SchoelGradeGuard_v9_3_1.exe
+Launch: Start GradeGuard.lnk
+Historical snapshots: C:\SchoelTools\archive\GradeGuard\2026-10-28
+The executable is a local unsigned build; no MSI deployment or Git push occurred.
+
+Changes tied to the audit
+------------------------
+1. Held controls: manual TC 610.000 stays 610.000 through a complete generation
+   run. Source provenance and approval persist. Legacy correction passes no
+   longer repeatedly rewrite final grades. Explicit HP/LP and sidewalk holds
+   are protected. Automatically inferred extrema are QA notes, not renamed stakes.
+
+2. Curb component: actual BC contour crossings hold their elevation. Selected
+   FL/gutter crossings add the entered curb height. The audited midpoint is
+   now 601.500, including the 0.500-foot addition. A near/short-gap contour
+   cannot override the FL conversion or become an approved station anchor.
+
+3. Connected runs: station interpolation uses the local continuous chain.
+   Separate runs cannot share station controls. Branched chains and drafted
+   gaps are not treated as one continuous station profile. Conflicting grades
+   at the same controlling station are withheld.
+
+4. Job state: all generation tools reset cached geometry and overrides. The
+   audited fresh subgrade result is 599.500 even after a different curb job.
+   Saved geometry selections and manual controls are checked against the
+   DXF path and SHA-256. Changed drawings and old unbound selections require
+   review and re-saving. Sidewalk/structure settings now save and load with jobs.
+
+5. Field export: curb, sidewalk, grid, structures and offsets share an approval
+   gate. A numeric elevation alone cannot bypass it. Unknown, conflicting,
+   review-only, nonfinite or zero results are omitted from field CSVs. Review
+   reports retain rejected calculations in an explicitly review-only column.
+   Offset approval comes from its parent BC point; offsets keep the BC elevation.
+
+6. LandXML: reads the documented Northing/Easting/Elevation order, selects one
+   named surface, scopes point IDs to that surface, checks face references and
+   declared units, excludes hidden faces, and rejects malformed files visibly.
+   Multiple surfaces require selection. Feature-line-only XML is rejected;
+   export the intended TIN points and faces instead of relying on curve chords.
+
+7. Source precedence: source selection now controls the runner. Preferred
+   LandXML cannot be replaced by a temporary contour TIN. Explicit DXF-surface
+   mode prioritizes a supported surface edge. Contours-only mode needs actual
+   connected contour controls. Surface BC versus FL meaning must be explicit
+   where it cannot be established from the source.
+
+8. Interpolation: geometric bracketing is required; same-side contours cannot
+   masquerade as a bracket. Conflicting duplicate XY grades reject temporary
+   TIN creation. Outside-surface and unconstrained temporary-TIN estimates stay
+   review-only. A nearby grade is not automatically a field grade.
+
+9. PDF alignment: corrected the reflected similarity-transform signs and
+   degeneracy handling. Explicit manual PDF controls with inadequate alignment
+   are rejected. Automatic text-center/extents alignment and unverified sheet
+   registration are review-only even when fit residual happens to be small.
+
+10. Labels: ambiguous BOC and unsupported HP/LP variants cannot supply an
+    approved grade. Held manual provenance survives label lookup. Conflicting
+    colocated controls are reported. Ordinary nearby text requires review of
+    its actual physical control location.
+
+11. Structures: OUT elevations belong to the matching structure ID. IN-only
+    and conflicting OUT records are withheld. Closed polygon centers use area
+    centroid instead of weighting the closing vertex twice. The audited square
+    center is (2,2). PDF text windows no longer include the preceding structure.
+
+12. Curves: corrected major positive/negative bulges, exact bulge midpoints,
+    full ellipse parameters, ARC WCS coordinates and 2D polyline OCS conversion.
+    Added negative-extrusion, 3D-polyline and rotated/scaled-block examples.
+
+13. Sidewalk: local conflicts are flagged instead of replacing held design
+    grades with a neighbor median. Automatic cross-slope changes require review;
+    explicit selected adjustments remain width * percent / 100.
+
+14. Numeric handling: removed the audited project-specific grade limits,
+    retains a DXF zero endpoint instead of substituting the other endpoint,
+    excludes CAD thickness as an elevation, and rejects invalid spacing and
+    nonfinite/negative calculation settings. Zero grades remain withheld by
+    policy and need office handling, even on a legitimate zero-datum site.
+
+15. Diagnostics: flow/conflict pairs follow station order within continuous
+    unbranched runs and do not bridge withheld intermediate grades. These are
+    grade diagnostics; they are not a hydraulic/drainage design calculation.
+
+Additional safeguards
+---------------------
+- DXF must declare US survey feet (code 21), or a unitless drawing must be
+  explicitly confirmed as US survey feet in Project files. Other unit systems
+  are rejected. No silent coordinate/unit/datum transformation is performed.
+- Reruns preserve existing products in the selected output folder and create a
+  new Run-date-time subfolder when earlier GradeGuard products are present.
+- Both AutoLISP import helpers accept quoted CSV fields, validate numeric
+  coordinates/elevations and skip RED/unknown/blank/zero rows. The old 3D command
+  aliases import points only; they no longer connect every CSV row by order.
+- The guided interface and animated dozer opening are retained.
+
+Using this build
+----------------
+1. Open Project files and choose the local DXF, PDF, output directory and
+   optional LandXML. Confirm the coordinate references and design authority.
+2. Select the intended LandXML surface name. Multiple surfaces cannot be merged
+   implicitly. Only check unitless-DXF confirmation after checking actual units.
+3. Re-pick BC/FL/sidewalk objects when an old selection lacks drawing validation
+   or the DXF has changed. Review and re-save manual controls for that drawing.
+4. Choose the tool, source preference and surface meaning. Confirm local curb
+   details, especially ramps/transitions; a preset is user input, not proof that
+   the software verified the PDF or that one height applies everywhere.
+5. Generate, review all warning and DO_NOT_STAKE reports, and compare independent
+   project controls/check values before accepting field CSVs.
+
+Intentional limits
+------------------
+No automated verification of signed plans, design authority, datum/geoid,
+benchmark/control residuals or survey accuracy is provided. Grid extents remain
+a buffered rectangle, not an irregular-site boundary clip. Users must verify
+layer meaning, physical label ownership, selected curb/FL correspondence, local
+curb detail applicability and the intended design surface. Unsupported surface
+formats and uncertain calculations are rejected or withheld, not guessed.
+
+Verification and reproducibility
+--------------------------------
+python -m unittest discover -s tests -v
+python tests/calculation_audit.py --report path-to-new-report.json
+python -m py_compile schoel_gradeguard.py gradeguard_ui.py gradeguard_splash.py
+git diff --check
+
+The audit has 78 cases; failures overlap and do not count distinct bugs or a
+real-world error rate. Its 9.3.0 result is preserved as historical evidence.
+Three fixture contracts were updated with the fixes: I03 requires explicit
+multi-surface selection instead of combining models; E01 marks its format-test
+point as an approved held control; R05 binds its manual control to the current
+drawing. No failing scenario was removed and no tolerance was loosened.
+
+The additional suite contains 30 new/extended regression tests beyond the
+original 19, covering numerical/input boundaries, drawing identity, export
+approval, reruns, curve coordinate systems and project-setting persistence.
+The separate release verification records executable checksums and UI/CAD
+smoke-test evidence. A real approved project comparison remains necessary.

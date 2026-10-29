@@ -8,11 +8,13 @@ venv/
 build/
 dist/
 installer_out/
+releases/
 *.spec
 
 # Generated GradeGuard outputs and local job state
 GradeGuard_Output/
 GradeGuard_Tick_Anchors.json
+GradeGuard_PDF_Controls*.json*
 GradeGuard_Selected_BC_Entities.json
 GradeGuard_Selected_Flowline_Entities.json
 GradeGuard_Selected_Edge_Sidewalk_Entities.json
@@ -30,3 +32,6 @@ GradeGuard_Manual_FL_OUT_Points.json
 .idea/
 Thumbs.db
 .DS_Store
+
+# Machine-local launch shortcuts
+*.lnk

@@ -1,0 +1,30 @@
+SCHOEL GRADEGUARD - CURRENT LOCAL FOLDER
+
+Active folder: C:\SchoelTools\SchoelGradeGuard
+Current version: 9.6.0 guided workflow pilot with animated dozer opening
+
+Double-click Start GradeGuard.lnk to run the current executable.
+Executable: dist\SchoelGradeGuard_v9_6_0.exe
+Source entry point: schoel_gradeguard.py
+Source branch: feature/simpler-workflow
+
+The dozer opening lasts five seconds. Click Open GradeGuard or press Enter,
+Space or Esc to skip it. Replay opening is available in the workspace header.
+
+Older local copies and their Git history are preserved in:
+C:\SchoelTools\archive\GradeGuard (dated subfolders)
+
+MOVE-MANIFEST.json in that archive records the original locations, relocated
+file counts and sizes, and GradeGuard source checksums.
+
+Use Open plans, Calculate, Review results on the home screen.
+Advanced settings reveals detailed file and tool options. Click a calculated
+point to see its source and grade profile. The colors match the dozer opening.
+This local unsigned build supports combined CAD and calibrated PDF-only jobs.
+Real-project checking and office review remain necessary.
+See docs\EASY-WORKFLOW-9.6.0.txt and the delivered validation records.
+Prior 9.5.0 source and executable are preserved in the 2026-10-29 archive,
+subfolder 09-Auto-Calculate-9.5.0.
+
+The unrelated .asset-tracker checkout remains in the former Desktop
+development folder. It is not part of this GradeGuard archive.

@@ -7,6 +7,7 @@ import json
 import traceback
 import base64
 import ctypes
+import hashlib
 import threading
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -29,7 +30,7 @@ except Exception:
     fitz = None
 
 Point2 = Tuple[float, float]
-APP_VERSION = "9.1.1"
+APP_VERSION = "9.6.0"
 
 @dataclass
 class GenPoint:
@@ -41,6 +42,9 @@ class GenPoint:
     source: str = ""
     issue: str = ""
     confidence: str = ""
+    approved: Optional[bool] = None
+    locked: bool = False
+    calculated_elevation: Optional[float] = None
 
 @dataclass
 class GradeLabel:
@@ -73,6 +77,8 @@ class LandXMLSurface:
     # GradeGuard keeps those 3D breakline segments here so they can be used as the elevation model.
     segments: List[ElevSegment] = field(default_factory=list)
     source: str = "LandXML surface"
+    name: str = ""
+    linear_unit: str = "USSurveyFoot"
 
 @dataclass
 class ContourTinSurface:
@@ -100,6 +106,110 @@ CURB_CONTROL_POINTS: List[Point2] = []
 # General non-curb linework used to find leader/tick endpoints for HP/LP callouts.
 # This helps when the text insertion point is not the actual curb control tick.
 DXF_LEADER_SEGMENTS: List[CurbSegment] = []
+
+
+
+def reset_generation_state():
+    global CURB_SEGMENTS, FLOWLINE_SEGMENTS, CURB_CONTROL_POINTS, CURB_PC_POINTS, CURB_PT_POINTS, DXF_LEADER_SEGMENTS, CONTOUR_POINT_OVERRIDES
+    CURB_SEGMENTS, FLOWLINE_SEGMENTS, CURB_CONTROL_POINTS = [], [], []
+    CURB_PC_POINTS, CURB_PT_POINTS, DXF_LEADER_SEGMENTS = [], [], []
+    CONTOUR_POINT_OVERRIDES = {}
+
+
+def held_result(conf, source):
+    tokens = {t.strip() for t in (conf or '').upper().split(';')}
+    return bool(tokens & {'HELD_CONTROL', 'PDF_TICK', 'HP_HARD_HOLD', 'LP_HARD_HOLD', 'MANUAL_FL_OUT'}) or 'MANUAL' in (source or '').upper()
+
+
+def field_approval(point):
+    try:
+        if not all(math.isfinite(float(v)) for v in (point.easting, point.northing, point.elevation)):
+            return False, 'Nonfinite coordinate or elevation.'
+        if abs(float(point.elevation)) <= 1e-9:
+            return False, 'Zero elevation requires explicit office review.'
+    except (TypeError, ValueError):
+        return False, 'Missing coordinate or elevation.'
+    if point.approved is False:
+        return False, 'Previous export approval was withheld.'
+    tokens = {t.strip() for t in (point.confidence or '').upper().split(';')}
+    text = ' '.join([point.source or '', point.issue or '']).upper()
+    blocking = ('NOT BRACKETED', 'UNSAFE', 'UNKNOWN', 'WITHHELD', 'DO NOT STAKE', 'CONFLICTING', 'NO EXPLICIT OUT', 'FALLBACK', 'CROSS-SLOPE', 'CROSS SLOPE', 'REVIEW REQUIRED')
+    if any(word in text for word in blocking) or any('REVIEW' in t or t.startswith('LOW') for t in tokens):
+        return False, 'Unresolved calculation/source review.'
+    trusted = {'HELD_CONTROL', 'PDF_TICK', 'HP_HARD_HOLD', 'LP_HARD_HOLD', 'MANUAL_FL_OUT', 'STRUCTURE_OUT',
+               'BC_CONTOUR_EXACT', 'FL_CONTOUR_PLUS_CURB_EXACT', 'BC_CHAIN_CONTOUR_INTERP', 'BC_TOUCH', 'BC_TOUCH_INTERP',
+               'FL_TOUCH_PLUS_CURB', 'FL_TOUCH_INTERP_PLUS_CURB', 'SURFACE_HIGH', 'FEATURELINE_HIGH',
+               'PERP_CONTOUR_HIGH', 'PERP_CONTOUR', 'LOCAL_CONTOUR_HOLD', 'LOCAL_CONTOUR_PRORATE'}
+    if tokens & trusted:
+        return True, ''
+    if point.approved is True and tokens == {'OFFSET'}:
+        return True, ''
+    return False, 'No approved elevation source. Review before staking.'
+
+
+def component_key_for_point(p):
+    local = safe_local_curb_chain(p)
+    if not local:
+        return None
+    return tuple(sorted(tuple(sorted((seg.a, seg.b))) for seg in local))
+
+
+def same_curb_run(a, b):
+    ka = component_key_for_point(a)
+    return ka is not None and ka == component_key_for_point(b)
+
+
+def safe_local_curb_chain(p):
+    """Station only an unbranched continuous chain; don't bridge drafted gaps."""
+    local = _local_curb_segments_for_point(p, max_endpoint_gap=1e-6)
+    if any(dist(a.b, b.a) > 1e-6 for a, b in zip(local, local[1:])):
+        return []
+    degree = {}
+    for seg in local:
+        for xy in (seg.a, seg.b):
+            key = (round(xy[0], 6), round(xy[1], 6))
+            degree[key] = degree.get(key, 0) + 1
+    return local if all(count <= 2 for count in degree.values()) else []
+
+
+def diagnostic_pairs(points):
+    """Adjacent stations within continuous unbranched runs, retaining missing-grade gaps."""
+    if not CURB_SEGMENTS:
+        for a, b in zip(points, points[1:]):
+            if a.elevation is not None and b.elevation is not None:
+                yield a, b, dist((a.easting, a.northing), (b.easting, b.northing))
+        return
+    groups = {}
+    for point in points:
+        xy = (point.easting, point.northing)
+        chain = safe_local_curb_chain(xy)
+        if not chain:
+            continue
+        key = tuple(sorted(tuple(sorted((seg.a, seg.b))) for seg in chain))
+        if key not in groups:
+            groups[key] = (chain, [])
+        chain, stations = groups[key]
+        station, _, distance, _ = _chain_station_for_point_on_segments(xy, chain)
+        if station is not None and distance <= 0.35:
+            stations.append((station, point))
+    for chain, stations in groups.values():
+        stations.sort(key=lambda item: item[0])
+        for (sa, a), (sb, b) in zip(stations, stations[1:]):
+            if a.elevation is not None and b.elevation is not None:
+                yield a, b, abs(sb - sa)
+
+
+def validate_generation_inputs(cad_path, spacing=None, units_confirmed=False):
+    if spacing is not None and (not math.isfinite(float(spacing)) or float(spacing) <= 0):
+        raise ValueError('Spacing must be a finite positive distance.')
+    if not os.path.isfile(cad_path) or os.path.splitext(cad_path)[1].lower() != '.dxf':
+        raise ValueError('Select an existing local DXF file.')
+    units = int(ezdxf.readfile(cad_path).units)
+    if units == 21 or (units == 0 and units_confirmed):
+        return
+    if units == 0:
+        raise ValueError('DXF units are unspecified. Confirm US survey feet in Project files after checking the source drawing; no conversion will be made.')
+    raise ValueError(f'DXF unit code {units} does not match the US-survey-foot workflow (21). Re-export in matching units; coordinates have not been converted.')
 
 
 def dist(a: Point2, b: Point2) -> float:
@@ -150,7 +260,7 @@ def parse_grade_text(raw: str) -> List[Tuple[str, float]]:
         (r"\b(?:H\.?\s*P\.?|HIGH\s*POINT|HIGHPOINT)\s*(?:EL(?:EV(?:ATION)?)?\.?\s*)?=?\s*([0-9]{2,4}\.[0-9]{1,3})", "HP"),
         (r"\b(?:L\.?\s*P\.?|LOW\s*POINT|LOWPOINT)\s*(?:EL(?:EV(?:ATION)?)?\.?\s*)?=?\s*([0-9]{2,4}\.[0-9]{1,3})", "LP"),
         (r"\bT\.?\s*C\.?\s*=?\s*([0-9]{2,4}\.[0-9]{1,3})", "TC"),
-        (r"\bB\.?\s*O\.?\s*C\.?\s*=?\s*([0-9]{2,4}\.[0-9]{1,3})", "BC"),
+        (r"\bB\.?\s*O\.?\s*C\.?\s*=?\s*([0-9]{2,4}\.[0-9]{1,3})", "BOC_AMBIG"),
         (r"\bB\.?\s*C\.?\s*=?\s*([0-9]{2,4}\.[0-9]{1,3})", "BC"),
         (r"\bF\.?\s*L\.?\s*=?\s*([0-9]{2,4}\.[0-9]{1,3})", "FL"),
         (r"\bFG\s*=?\s*([0-9]{2,4}\.[0-9]{1,3})", "FG"),
@@ -207,7 +317,7 @@ def arc_points_from_entity(ent, spacing: float = 1.0) -> List[Point2]:
         arc_len = max(r * span, 0.0)
         max_chord = max(float(spacing or 1.0), 0.10)
         n = max(2, int(math.ceil(arc_len / max_chord)) + 1)
-        pts = [(float(v.x), float(v.y)) for v in tool.vertices(list(tool.angles(n)))]
+        pts = [(float(v.x), float(v.y)) for v in ent.vertices(list(tool.angles(n)))]
         if len(pts) >= 2:
             return pts
     except Exception:
@@ -257,12 +367,9 @@ def bulge_segment_points(a: Point2, b: Point2, bulge: float, spacing: float = 5.
     ux, uy = dx / chord, dy / chord
     # left normal to chord
     nx, ny = -uy, ux
-    h_sq = max(r * r - (chord / 2.0) ** 2, 0.0)
-    h = math.sqrt(h_sq)
-    # For positive bulge, center is to the left of the chord from start to end.
-    # For negative bulge, center is to the right.
-    sign = 1.0 if bulge > 0 else -1.0
-    cx, cy = mx + sign * nx * h, my + sign * ny * h
+    h = chord * (1.0 - float(bulge)**2) / (4.0 * float(bulge))
+    # Signed offset also handles arcs exceeding 180 degrees.
+    cx, cy = mx + nx * h, my + ny * h
     a0 = math.atan2(y1 - cy, x1 - cx)
     sweep = theta
     arc_len = abs(sweep) * r
@@ -276,6 +383,55 @@ def bulge_segment_points(a: Point2, b: Point2, bulge: float, spacing: float = 5.
     pts[0] = a
     pts[-1] = b
     return pts
+
+
+def bulge_midpoint(a, b, bulge):
+    """Exact half-angle point, independent of display tessellation spacing."""
+    if abs(bulge) < 1e-12:
+        return lerp(a, b, 0.5)
+    # The arc midpoint lies on the perpendicular bisector, at half-chord * bulge.
+    return ((a[0] + b[0]) / 2 + (b[1] - a[1]) * bulge / 2,
+            (a[1] + b[1]) / 2 - (b[0] - a[0]) * bulge / 2)
+
+
+def polyline_xy_to_wcs(ent, points):
+    """Convert 2D polyline OCS coordinates; 3D polyline vertices already use WCS."""
+    typ = ent.dxftype()
+    if typ != 'LWPOLYLINE' and not (typ == 'POLYLINE' and ent.is_2d_polyline):
+        return points
+    elevation = ent.dxf.elevation
+    z = float(elevation if typ == 'LWPOLYLINE' else elevation.z)
+    ocs = ent.ocs()
+    return [(v.x, v.y) for v in (ocs.to_wcs((x, y, z)) for x, y in points)]
+
+
+def validate_saved_drawing(data, cad_path):
+    if not cad_path:
+        return
+    saved = data.get('cad_path') or data.get('dxf_path') or ''
+    if not saved or os.path.normcase(os.path.abspath(saved)) != os.path.normcase(os.path.abspath(cad_path)):
+        raise ValueError('Saved controls belong to another or unspecified drawing. Re-pick/re-save them for the current DXF.')
+    if data.get('dxf_sha256') != drawing_fingerprint(cad_path):
+        raise ValueError('Saved controls predate drawing validation or the DXF has changed. Review and re-save these controls.')
+
+
+def prepare_output_directory(out_dir):
+    """Keep existing GradeGuard deliverables intact when a calculation is rerun."""
+    if not str(out_dir).strip():
+        raise ValueError('Select an output folder.')
+    os.makedirs(out_dir, exist_ok=True)
+    if any(name.startswith(('Generated_', 'GradeGuard_', 'FL_OUT_DO_NOT', 'Sidewalk_DO_NOT', 'Grade_Grid_DO_NOT'))
+           and os.path.isfile(os.path.join(out_dir, name)) for name in os.listdir(out_dir)):
+        from datetime import datetime
+        import tempfile
+        return tempfile.mkdtemp(prefix='Run-' + datetime.now().strftime('%Y%m%d-%H%M%S') + '-', dir=out_dir)
+    return out_dir
+
+
+def validate_numeric_settings(**settings):
+    for name, value in settings.items():
+        if not math.isfinite(float(value)) or float(value) < 0:
+            raise ValueError(name.replace('_', ' ') + ' must be finite and nonnegative.')
 
 
 def polyline_points(ent, arc_spacing: float = 5.0) -> List[Point2]:
@@ -328,7 +484,7 @@ def polyline_points(ent, arc_spacing: float = 5.0) -> List[Point2]:
             if pts:
                 seg = seg[1:]
             pts.extend(seg)
-    return pts
+    return polyline_xy_to_wcs(ent, pts)
 
 
 def line_points(ent) -> List[Point2]:
@@ -361,7 +517,7 @@ def picker_entity_points(ent, spacing: float = 0.75, depth: int = 0) -> List[Poi
         if typ == "ELLIPSE":
             pts = []
             try:
-                for v in ent.vertices(params=[i/72 for i in range(73)]):
+                for v in ent.vertices(params=ent.params(73)):
                     pts.append((float(v.x), float(v.y)))
             except Exception:
                 try:
@@ -413,6 +569,8 @@ def picker_entity_points(ent, spacing: float = 0.75, depth: int = 0) -> List[Poi
 
 def sample_segment(a: Point2, b: Point2, spacing: float) -> List[Point2]:
     L = dist(a, b)
+    if not math.isfinite(float(spacing)) or spacing <= 0:
+        raise ValueError("Point spacing must be a finite positive distance.")
     if L == 0:
         return [a]
     n = int(math.floor(L / spacing))
@@ -459,23 +617,11 @@ def _point_at_half_station(dense: List[Point2]) -> Optional[Point2]:
 
 
 def arc_key_points_from_entity(ent) -> List[Point2]:
-    """Return PC, MID, PT for a true ARC entity in WCS."""
-    dense = arc_points_from_entity(ent, spacing=1.0)
-    if len(dense) >= 2:
-        mid = _point_at_half_station(dense) or dense[len(dense)//2]
-        return [dense[0], mid, dense[-1]]
-    center = (float(ent.dxf.center.x), float(ent.dxf.center.y))
-    r = float(ent.dxf.radius)
-    start = math.radians(float(ent.dxf.start_angle))
-    end = math.radians(float(ent.dxf.end_angle))
+    """Exact angular PC/MID/PT in WCS, including negative extrusion."""
+    start, end = float(ent.dxf.start_angle), float(ent.dxf.end_angle)
     if end < start:
-        end += math.tau
-    mid = (start + end) / 2.0
-    return [
-        (center[0] + r * math.cos(start), center[1] + r * math.sin(start)),
-        (center[0] + r * math.cos(mid), center[1] + r * math.sin(mid)),
-        (center[0] + r * math.cos(end), center[1] + r * math.sin(end)),
-    ]
+        end += 360.0
+    return [(float(v.x), float(v.y)) for v in ent.vertices([start, (start + end) / 2, end])]
 
 
 def generic_curve_key_points_from_entity(ent, spacing: float = 0.5) -> List[Point2]:
@@ -541,8 +687,7 @@ def staking_points_from_entity(ent, spacing: float) -> Tuple[List[Point2], List[
         for p0, p1 in pairs:
             a = (p0[0], p0[1]); b = (p1[0], p1[1]); bulge = p0[2]
             if abs(bulge) > 1e-12:
-                dense = bulge_segment_points(a, b, bulge, spacing=max(0.5, min(2.0, spacing/8.0)))
-                mid = _point_at_half_station(dense) or lerp(a, b, 0.5)
+                mid = bulge_midpoint(a, b, bulge)
                 keys = [a, mid, b]
                 add_seq(keys)
                 controls.extend(keys)
@@ -573,8 +718,7 @@ def staking_points_from_entity(ent, spacing: float) -> Tuple[List[Point2], List[
         for p0, p1 in pairs:
             a = (p0[0], p0[1]); b = (p1[0], p1[1]); bulge = p0[2]
             if abs(bulge) > 1e-12:
-                dense = bulge_segment_points(a, b, bulge, spacing=max(0.5, min(2.0, spacing/8.0)))
-                mid = _point_at_half_station(dense) or lerp(a, b, 0.5)
+                mid = bulge_midpoint(a, b, bulge)
                 keys = [a, mid, b]
                 add_seq(keys)
                 controls.extend(keys)
@@ -605,7 +749,7 @@ def staking_points_from_entity(ent, spacing: float) -> Tuple[List[Point2], List[
                 add_seq(keys)
                 controls.extend(keys)
 
-    return dedupe_points(stake), dedupe_points(controls)
+    return dedupe_points(polyline_xy_to_wcs(ent, stake)), dedupe_points(polyline_xy_to_wcs(ent, controls))
 
 def dedupe_points(points: List[Point2], tol: float = 0.05) -> List[Point2]:
     """Preserve first-seen points while avoiding an O(n^2) full-list scan."""
@@ -687,7 +831,7 @@ def pc_pt_points_from_entity(ent) -> Tuple[List[Point2], List[Point2]]:
                     pcs.append(keys[0]); pts.append(keys[-1])
     except Exception:
         pass
-    return pcs, pts
+    return polyline_xy_to_wcs(ent, pcs), polyline_xy_to_wcs(ent, pts)
 
 
 def _near_any_control(point: GenPoint, controls: List[Point2], tol: float = 0.08) -> bool:
@@ -709,7 +853,7 @@ def apply_pc_pt_descriptions(points: List[GenPoint], base_desc: str = 'BC'):
 
 def entity_z(ent) -> Optional[float]:
     candidates = []
-    for attr in ("elevation", "thickness"):
+    for attr in ("elevation",):
         try:
             candidates.append(float(getattr(ent.dxf, attr)))
         except Exception:
@@ -815,122 +959,73 @@ def _xml_local(tag: str) -> str:
     return tag.split('}', 1)[-1] if '}' in tag else tag
 
 def _parse_landxml_xyz(text: str) -> Optional[Tuple[float, float, float]]:
-    txt = (text or '').strip()
-    if not txt:
+    """LandXML PointType is Northing Easting Elevation, regardless of magnitude."""
+    try:
+        values = [float(v) for v in re.split(r'[,\s]+', (text or '').strip()) if v]
+    except ValueError:
         return None
-    vals = []
-    for v in re.split(r'[,\s]+', txt):
-        if not v.strip():
-            continue
-        try:
-            vals.append(float(v))
-        except Exception:
-            return None
-    if len(vals) < 3:
+    if len(values) != 3 or not all(math.isfinite(v) for v in values):
         return None
-    a, b, z = vals[0], vals[1], vals[2]
-    # LandXML files from Civil 3D commonly write northing easting elevation for Alabama State Plane exports.
-    # GradeGuard stores XY as easting, northing. Use the larger coordinate as northing when obvious.
-    if abs(a) > abs(b) * 1.5:
-        n, e = a, b
-    elif abs(b) > abs(a) * 1.5:
-        e, n = a, b
-    else:
-        e, n = a, b
-    return float(e), float(n), float(z)
+    n, e, z = values
+    return e, n, z
 
 
-def load_landxml_surface(path: str) -> Optional[LandXMLSurface]:
-    """Read Civil 3D/LandXML data.
+def load_landxml_surface(path: str, surface_name: str = "") -> Optional[LandXMLSurface]:
+    """Read one explicitly identified model, keeping point IDs local to each surface.
 
-    GradeGuard supports both of these common Civil 3D exports:
-    1) A true TIN surface with <Surfaces>/<Definition>/<Pnts>/<P> and <Faces>/<F>.
-    2) A grading XML that contains <PlanFeatures>/<PlanFeature>/<CoordGeom> feature lines.
-
-    The second case is what many grading files actually contain. Older GradeGuard builds only
-    looked for TIN faces, so they returned no elevations from these files.
+    This application currently calculates in US survey feet. No implicit unit,
+    datum, axis, or coordinate transformation is performed.
     """
-    if not path or not os.path.exists(path):
+    if not path:
         return None
+    if not os.path.isfile(path):
+        raise ValueError("Selected LandXML file does not exist: " + path)
     try:
         root = ET.parse(path).getroot()
-    except Exception as e:
-        raise RuntimeError(f"Could not read LandXML/XML surface: {e}")
-
-    # --- True LandXML TIN surface ---
-    pnts: Dict[str, Tuple[float, float, float]] = {}
-    for el in root.iter():
-        if _xml_local(el.tag).lower() == 'p':
-            pid = el.attrib.get('id') or el.attrib.get('ID')
-            xyz = _parse_landxml_xyz(el.text or '')
-            if not pid or xyz is None:
-                continue
-            e, n, z = xyz
-            if valid_grade_z(z):
-                pnts[str(pid)] = (float(e), float(n), float(z))
-    faces = []
-    for el in root.iter():
-        if _xml_local(el.tag).lower() == 'f':
-            ids = [v for v in re.split(r'[,\s]+', (el.text or '').strip()) if v]
-            if len(ids) >= 3 and all(i in pnts for i in ids[:3]):
-                faces.append((pnts[ids[0]], pnts[ids[1]], pnts[ids[2]]))
-
-    # --- Civil 3D PlanFeatures / FeatureLines ---
-    feature_segments: List[ElevSegment] = []
-    feature_count = 0
-    for pf in root.iter():
-        if _xml_local(pf.tag).lower() != 'planfeature':
+    except Exception as ex:
+        raise ValueError(f"Could not read selected LandXML: {ex}") from ex
+    units = [el for el in root.iter() if _xml_local(el.tag) in ('Imperial', 'Metric')]
+    if len(units) != 1 or units[0].attrib.get('linearUnit', '').lower() != 'ussurveyfoot':
+        raise ValueError("LandXML must explicitly declare USSurveyFoot for this US-survey-foot workflow. Re-export in the project units; no conversion was applied.")
+    if units[0].attrib.get('elevationUnit', '').lower() not in ('feet', 'foot', 'ussurveyfoot'):
+        raise ValueError("LandXML elevation units must explicitly be feet. Confirm the vertical reference before export.")
+    surfaces = [el for el in root.iter() if _xml_local(el.tag) == 'Surface']
+    if surface_name:
+        surfaces = [el for el in surfaces if el.attrib.get('name', '') == surface_name]
+        if len(surfaces) != 1:
+            raise ValueError(f"Select one uniquely named LandXML surface: {surface_name!r} was not unique or was absent.")
+    elif len(surfaces) > 1:
+        names = ', '.join(el.attrib.get('name', '<unnamed>') for el in surfaces)
+        raise ValueError("LandXML contains multiple surfaces. Enter the proposed surface name in Project files: " + names)
+    if not surfaces:
+        raise ValueError("No TIN surface found. Export the intended Civil 3D surface as points AND faces; feature-line-only XML is not a surface model.")
+    selected = surfaces[0]
+    pnts = {}
+    for el in selected.iter():
+        if _xml_local(el.tag) != 'P':
             continue
-        feature_count += 1
-        layer = 'LandXML FeatureLine'
-        try:
-            for prop in pf.iter():
-                if _xml_local(prop.tag).lower() == 'property' and (prop.attrib.get('label','').lower() == 'layer'):
-                    layer = prop.attrib.get('value') or layer
-        except Exception:
-            pass
-        for geom in pf.iter():
-            if _xml_local(geom.tag).lower() == 'line':
-                start = end = None
-                for child in geom:
-                    lname = _xml_local(child.tag).lower()
-                    if lname == 'start':
-                        start = _parse_landxml_xyz(child.text or '')
-                    elif lname == 'end':
-                        end = _parse_landxml_xyz(child.text or '')
-                if start and end and valid_grade_z(start[2]) and valid_grade_z(end[2]):
-                    feature_segments.append(ElevSegment((start[0], start[1]), (end[0], end[1]), start[2], layer, f"LandXML FeatureLine {layer}", end[2]))
-            elif _xml_local(geom.tag).lower() == 'curve':
-                start = end = center = None
-                for child in geom:
-                    lname = _xml_local(child.tag).lower()
-                    if lname == 'start':
-                        start = _parse_landxml_xyz(child.text or '')
-                    elif lname == 'end':
-                        end = _parse_landxml_xyz(child.text or '')
-                    elif lname == 'center':
-                        xy = [float(v) for v in re.split(r'[,\s]+', (child.text or '').strip()) if v.strip()]
-                        if len(xy) >= 2:
-                            # Center has no Z. Use same coordinate order heuristic.
-                            a,b = xy[0], xy[1]
-                            if abs(a) > abs(b)*1.5:
-                                center = (b,a)
-                            elif abs(b) > abs(a)*1.5:
-                                center = (a,b)
-                            else:
-                                center = (a,b)
-                if start and end and valid_grade_z(start[2]) and valid_grade_z(end[2]):
-                    # Approximate curves with a short chord for elevation sampling. Geometry remains from the DXF BC layer.
-                    feature_segments.append(ElevSegment((start[0], start[1]), (end[0], end[1]), start[2], layer, f"LandXML FeatureLine curve {layer}", end[2]))
-
-    if not faces and not feature_segments:
-        return None
-    src = os.path.basename(path)
-    if feature_segments and not faces:
-        src += f" ({len(feature_segments)} feature-line segments)"
-    elif feature_segments:
-        src += f" ({len(faces)} TIN faces, {len(feature_segments)} feature-line segments)"
-    return LandXMLSurface(faces, feature_segments, source=src)
+        pid = el.attrib.get('id')
+        xyz = _parse_landxml_xyz(el.text or '')
+        if not pid or xyz is None or pid in pnts:
+            raise ValueError("Invalid or duplicate point ID within selected LandXML surface.")
+        pnts[pid] = xyz
+    faces = []
+    for el in selected.iter():
+        if _xml_local(el.tag) != 'F':
+            continue
+        if el.attrib.get('i', '0').lower() in ('1', 'true'):
+            continue
+        ids = (el.text or '').split()
+        if len(ids) != 3 or not all(i in pnts for i in ids):
+            raise ValueError("LandXML face references missing/invalid vertices.")
+        tri = tuple(pnts[i] for i in ids)
+        if _barycentric_xy((tri[0][0], tri[0][1]), tri) is None:
+            raise ValueError("Selected LandXML contains a degenerate triangle.")
+        faces.append(tri)
+    if not faces:
+        raise ValueError("Selected LandXML surface has no usable faces.")
+    name = selected.attrib.get('name', '')
+    return LandXMLSurface(faces, source=os.path.basename(path) + ' / ' + name, name=name)
 
 def _barycentric_xy(p: Point2, tri):
     x,y = p; (x1,y1,z1),(x2,y2,z2),(x3,y3,z3) = tri
@@ -956,7 +1051,7 @@ def landxml_elevation_at(p: Point2, surface: Optional[LandXMLSurface], search_pa
         if bc is None:
             continue
         l1,l2,l3=bc
-        if l1 >= -0.005 and l2 >= -0.005 and l3 >= -0.005:
+        if l1 >= -1e-10 and l2 >= -1e-10 and l3 >= -1e-10:
             z = l1*tri[0][2] + l2*tri[1][2] + l3*tri[2][2]
             return z, f"LandXML/TIN surface {surface.source}", "SURFACE_HIGH"
         d = min(point_segment_distance(p, (tri[0][0],tri[0][1]), (tri[1][0],tri[1][1])),
@@ -990,10 +1085,8 @@ def landxml_elevation_at(p: Point2, surface: Optional[LandXMLSurface], search_pa
 
 def valid_grade_z(z) -> bool:
     try:
-        z = float(z)
-        # Project elevations vary by job. Reject obvious zeros/placeholders but allow normal site elevations.
-        return abs(z) > 1e-6 and -10000.0 <= z <= 10000.0
-    except Exception:
+        return math.isfinite(float(z)) and abs(float(z)) > 1e-9
+    except (TypeError, ValueError):
         return False
 
 
@@ -1109,24 +1202,32 @@ def detect_curb_layers(dxf_path: str, keywords: Optional[List[str]] = None, docu
 
 
 
-def load_selected_curb_handles(path: str) -> List[str]:
-    """Read manually picked back-of-curb entity handles.
-    When this list exists, GradeGuard ignores automatic curb-layer detection for geometry
-    and uses only these entities as BC. This is critical when one layer, such as P-CURB,
-    contains face of curb, gutter, and back of curb linework.
-    """
-    if not path or not os.path.exists(path):
+def load_selected_curb_handles(path: str, cad_path: str = '') -> List[str]:
+    if not path or not os.path.isfile(path):
         return []
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return [str(x) for x in data.get("handles", [])]
-        if isinstance(data, list):
-            return [str(x) for x in data]
-    except Exception:
-        pass
-    return []
+        with open(path, encoding='utf-8') as stream:
+            data=json.load(stream)
+    except Exception as ex:
+        raise ValueError(f'Cannot read geometry selection: {ex}') from ex
+    if cad_path:
+        if not isinstance(data,dict) or not data.get('dxf_path'):
+            raise ValueError('This selection has no drawing identity. Pick the geometry again for this DXF.')
+        if os.path.normcase(os.path.abspath(data['dxf_path'])) != os.path.normcase(os.path.abspath(cad_path)):
+            raise ValueError('Saved geometry belongs to another DXF. Pick geometry for the current drawing.')
+        saved=data.get('dxf_sha256')
+        if not saved or saved != drawing_fingerprint(cad_path):
+            raise ValueError('DXF changed or the selection predates fingerprint validation. Pick the geometry again.')
+    if isinstance(data,dict):
+        return [str(h) for h in data.get('handles',[])]
+    if isinstance(data,list) and not cad_path:
+        return list(map(str,data))
+    raise ValueError('Invalid geometry-selection file.')
+
+
+def drawing_fingerprint(path):
+    with open(path,'rb') as stream:
+        return hashlib.file_digest(stream,'sha256').hexdigest()
 
 
 def save_selected_curb_handles(path: str, handles: List[str], dxf_path: str = ""):
@@ -1136,6 +1237,7 @@ def save_selected_curb_handles(path: str, handles: List[str], dxf_path: str = ""
             "version": "8.5.5",
             "purpose": "Manually selected DXF entity handles. Used for BC or FL/gutter depending on selection file.",
             "dxf_path": dxf_path,
+            "dxf_sha256": drawing_fingerprint(dxf_path) if dxf_path else "",
             "handles": sorted(set(str(h) for h in handles)),
         }, f, indent=2)
 
@@ -1225,7 +1327,7 @@ def load_dxf_geometry_and_elevations(dxf_path: str, curb_keywords: List[str], el
                     a = (float(ent.dxf.start.x), float(ent.dxf.start.y))
                     b = (float(ent.dxf.end.x), float(ent.dxf.end.y))
                     z1 = float(ent.dxf.start.z) if valid_grade_z(ent.dxf.start.z) else entity_z(ent)
-                    z2 = float(ent.dxf.end.z) if valid_grade_z(ent.dxf.end.z) else z1
+                    z2 = float(ent.dxf.end.z) if math.isfinite(float(ent.dxf.end.z)) else None
                     if z1 is not None and z2 is not None and dist(a, b) > 0.001:
                         elev_segments.append(ElevSegment(a, b, float(z1), layer, f"DXF surface/contour layer {layer}", float(z2)))
                         stats["elevation_layers"][layer] = stats["elevation_layers"].get(layer, 0) + 1
@@ -1480,8 +1582,14 @@ def point_override_key(p: Point2) -> Tuple[int, int]:
     return (int(round(float(p[0]) * 1000.0)), int(round(float(p[1]) * 1000.0)))
 
 def set_contour_point_override(p: Point2, elev: float, src: str, conf: str, issue: str = "") -> None:
-    global CONTOUR_POINT_OVERRIDES
-    CONTOUR_POINT_OVERRIDES[point_override_key(p)] = (float(elev), src, conf, issue)
+    key = point_override_key(p)
+    old = CONTOUR_POINT_OVERRIDES.get(key)
+    if old and old[2] == 'BC_CONTOUR_EXACT' and conf != 'BC_CONTOUR_EXACT':
+        return
+    if old and old[2] == conf and abs(old[0] - elev) > 1e-6:
+        CONTOUR_POINT_OVERRIDES[key] = (float(elev), src, 'CONTROL_CONFLICT_REVIEW', 'Conflicting exact contour elevations at one point.')
+        return
+    CONTOUR_POINT_OVERRIDES[key] = (float(elev), src, conf, issue)
 
 def get_contour_point_override(p: Point2) -> Optional[Tuple[float, str, str, str]]:
     return CONTOUR_POINT_OVERRIDES.get(point_override_key(p))
@@ -1623,7 +1731,7 @@ def add_high_low_callout_points(base_points: List[Point2], labels: List[GradeLab
         # fall back to projecting the text insertion point to the selected BC.
         q = _callout_tick_point_from_leaders(lab)
         if q is None:
-            q, d = _nearest_point_on_curb((lab.x, lab.y), max_dist=max_label_to_curb_dist)
+            q, d = _nearest_point_on_curb((lab.x, lab.y), max_dist=0.35)
             if q is None:
                 continue
         # Avoid repeated HP/LP anchors from duplicate text objects.
@@ -1648,37 +1756,24 @@ def add_high_low_callout_points(base_points: List[Point2], labels: List[GradeLab
 
 
 def tag_high_low_points(points: List[GenPoint], max_gap: float = 55.0, min_change: float = 0.02):
-    """Detect likely HP and LP grade breaks after elevations are assigned.
-
-    This does not replace plan callouts. It helps GradeGuard understand curb flow
-    by recognizing where generated grades rise then fall (HP) or fall then rise
-    (LP) along nearby consecutive BC points. These locations are tagged in the
-    source/issue column so they are visible in the debug CSV and report.
-    """
-    for i in range(1, len(points) - 1):
-        prev = points[i-1]
-        cur = points[i]
-        nxt = points[i+1]
-        if prev.elevation is None or cur.elevation is None or nxt.elevation is None:
+    """Flag local extrema for review without changing a design grade or a stake description."""
+    before, after = {}, {}
+    for a, b, distance in diagnostic_pairs(points):
+        if 0.1 < distance <= max_gap:
+            after[id(a)] = b
+            before[id(b)] = a
+    for cur in points:
+        prev, nxt = before.get(id(cur)), after.get(id(cur))
+        if prev is None or nxt is None or cur.locked:
             continue
-        d1 = dist((prev.easting, prev.northing), (cur.easting, cur.northing))
-        d2 = dist((cur.easting, cur.northing), (nxt.easting, nxt.northing))
-        if d1 <= 0.1 or d2 <= 0.1 or d1 > max_gap or d2 > max_gap:
-            continue
+        kind = ''
         if cur.elevation >= prev.elevation + min_change and cur.elevation >= nxt.elevation + min_change:
-            note = "Detected possible HIGH POINT from curb elevations. Verify against C-5.0 HP/T.C. callout."
-            cur.source = (cur.source + " | " if cur.source else "") + "POSSIBLE HP"
-            cur.desc = "BC HP"
-            cur.issue = (cur.issue + " " if cur.issue else "") + note
-            if not cur.confidence:
-                cur.confidence = "HP_REVIEW"
+            kind = 'HIGH'
         elif cur.elevation <= prev.elevation - min_change and cur.elevation <= nxt.elevation - min_change:
-            note = "Detected possible LOW POINT from curb elevations. Verify against C-5.0 L.P./T.C. callout and drainage inlet direction."
-            cur.source = (cur.source + " | " if cur.source else "") + "POSSIBLE LP"
-            cur.desc = "BC LP"
-            cur.issue = (cur.issue + " " if cur.issue else "") + note
-            if not cur.confidence:
-                cur.confidence = "LP_REVIEW"
+            kind = 'LOW'
+        if kind:
+            note = f'Possible {kind} point from adjacent grades; verify the physical plan control and drainage.'
+            cur.issue = (cur.issue + ' ' if cur.issue else '') + note
 
 
 
@@ -1872,8 +1967,7 @@ def affine_from_layout_coordinates(pdf_path: str) -> Tuple[Optional[Tuple[List[f
     A = np.array([[a[0], a[1], 1.0] for a in anchors], dtype=float)
     E = np.array([a[2] for a in anchors], dtype=float)
     N = np.array([a[3] for a in anchors], dtype=float)
-    # Use all callouts as a best-fit transform. This is good enough to make PDF spots primary when close,
-    # and the report still records the source and confidence for review.
+    # Text centers provide a preview transform, not controlled physical tick positions.
     ce = np.linalg.lstsq(A, E, rcond=None)[0]
     cn = np.linalg.lstsq(A, N, rcond=None)[0]
     errs = []
@@ -1882,8 +1976,8 @@ def affine_from_layout_coordinates(pdf_path: str) -> Tuple[Optional[Tuple[List[f
         errs.append(math.hypot(float(ce @ v) - a[2], float(cn @ v) - a[3]))
     rmse = math.sqrt(sum(e*e for e in errs) / len(errs)) if errs else None
     info["rmse_ft"] = rmse
-    if rmse and rmse > 20:
-        info["warning"] = "PDF to CAD alignment is approximate. Spot elevations are primary, but review labels near dense curb areas."
+    info["warning"] = "Text-center alignment and cross-sheet registration are unverified. Automatic PDF grades are review-only; use explicit CAD tick controls."
+    doc.close()
     return (ce.tolist(), cn.tolist()), info
 
 
@@ -2112,72 +2206,25 @@ def fallback_pdf_to_cad_model_from_extents(pdf_path: str, grading_page_index: in
 
 
 def parse_pdf_grade_block(raw: str) -> List[Tuple[str, float]]:
-    parsed = parse_grade_text(raw)
-    up = raw.replace("\\P", " ").replace("\n", " ").upper()
-    # Add F.G. and standalone spot-grade values from C-5.0. Keep them as lower confidence than TC/FL/HP/LP.
-    for m in re.finditer(r"\bF\.?\s*G\.?\s*=?\s*([0-9]{3}\.[0-9]{1,3})", up):
-        try:
-            parsed.append(("FG", float(m.group(1))))
-        except Exception:
-            pass
-    if not parsed:
-        nums = re.findall(r"\b(7[34][0-9]\.[0-9]{1,3})\b", up)
-        if len(nums) == 1 and len(up.strip()) <= 24:
-            try:
-                parsed.append(("SPOT", float(nums[0])))
-            except Exception:
-                pass
-    return parsed
+    """Read observations with their printed labels, without assuming a curb meaning."""
+    from gradeguard_pdf import parse_callouts
+    return [(label, value) for label, value, _flags in parse_callouts(raw)]
 
 
 def extract_pdf_spot_labels(pdf_path: str, default_curb_height: float, cad_reference_points: Optional[List[Point2]] = None) -> Tuple[List[GradeLabel], Dict[str, Any]]:
-    """Extract C-5.0 grading spot labels and roughly locate them in CAD coordinates.
-    These are used before contour interpolation.
+    """Scan every sheet for review; PDF text boxes are not CAD control positions.
+
+    Use Read PDF grades to verify meanings and save drawing-bound CAD ticks.
+    No guessed sheet alignment or abbreviation can promote a PDF observation.
     """
-    labels: List[GradeLabel] = []
-    info = {"grading_page": None, "pdf_spot_labels": 0, "alignment": {}}
-    if fitz is None or not pdf_path or not os.path.exists(pdf_path):
-        return labels, info
-    doc = fitz.open(pdf_path)
-    pi = find_plan_page(doc, "C-5.0", "GRADING", 5)
-    info["grading_page"] = pi + 1
-    model, ainfo = affine_from_layout_coordinates(pdf_path)
-    if model is None:
-        model, ainfo = fallback_pdf_to_cad_model_from_extents(pdf_path, pi, cad_reference_points)
-    info["alignment"] = ainfo
-    if model is None:
-        return labels, info
-    page = doc[pi]
-    line_segments = None
-    for b in page.get_text("dict").get("blocks", []):
-        if b.get("type") != 0:
-            continue
-        raw = block_text(b)
-        parsed = parse_pdf_grade_block(raw)
-        if not parsed:
-            continue
-        # Skip the legend block. It contains terms without useful point locations.
-        if "FINISHED GRADE" in raw.upper() and "TOP OF CURB" in raw.upper():
-            continue
-        x0, y0, x1, y1 = b["bbox"]
-        if line_segments is None:
-            line_segments = _pdf_page_line_segments(page)
-        tip = _pdf_leader_tip_for_text_block(page, b["bbox"], line_segments=line_segments)
-        if tip is None:
-            # Last resort only.  The review/source text will show that this came from the text box.
-            px, py = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-            tip_note = "text box center fallback"
-        else:
-            px, py = tip
-            tip_note = "leader/arrow/tick endpoint"
-        e, n = apply_affine(model, px, py)
-        for kind, elev in parsed:
-            # Do not hard-code one project elevation range.  This job is around 610-625,
-            # while other Schoel jobs may be 700s or very different datum values.
-            if -10000.0 <= elev <= 100000.0:
-                labels.append(GradeLabel(e, n, kind, elev, raw.strip(), f"PDF grading spot page {pi+1} at {tip_note}"))
-    info["pdf_spot_labels"] = len(labels)
-    return labels, info
+    from gradeguard_pdf import scan_pdf
+    rows, info = scan_pdf(pdf_path)
+    info['pdf_spot_labels'] = len(rows)
+    info['hp_lp_observations'] = sum(any(token in r.label for token in ('HP','LP','HIGH POINT','LOW POINT')) for r in rows)
+    info['alignment'] = {'warning': 'PDF observations have no verified CAD position. Use reviewed CAD tick controls.'}
+    info['observations'] = [dict(page=r.page,label=r.label,elevation=r.elevation,raw=r.raw,
+                                 bbox=r.bbox,method=r.method,flags=r.flags) for r in rows]
+    return [], info
 
 
 def pdf_hp_lp_hard_hold_is_trusted(label: GradeLabel, alignment: Dict[str, Any]) -> bool:
@@ -2210,35 +2257,30 @@ def label_priority(kind: str) -> int:
 
 
 def nearest_label_elevation(p: Point2, labels: List[GradeLabel], default_curb_height: float, label_radius: float) -> Tuple[Optional[float], str, str]:
-    """Pick the controlling spot elevation for a BC point.
-
-    Important surveying rule:
-    - TC / Top of Curb / HP-TC / LP-TC controls BC staking.
-    - FL is flow line and only becomes BC by adding curb height when no TC/BC/HP/LP label controls.
-    - FG and standalone contour/spot values are weaker and should not beat a nearby TC callout.
-    """
-    if not labels:
-        return None, "", ""
+    allowed = {'TC', 'BC', 'HP', 'LP', 'HP_TC', 'LP_TC', 'FL', 'FG', 'SPOT', 'ELEV'}
     candidates = []
     for lab in labels:
+        if lab.kind not in allowed or not valid_grade_z(lab.elev):
+            continue
         d = dist(p, (lab.x, lab.y))
-        if d <= label_radius:
-            pr = label_priority(lab.kind)
-            # Prefer PDF C-5.0 callouts over CAD text when priority and distance are close.
-            source_bonus = 0 if lab.source.upper().startswith("PDF") else 0.25
-            candidates.append((pr, source_bonus, d, lab))
+        if d > label_radius:
+            continue
+        source = lab.source.upper()
+        rank = 0 if 'MANUAL' in source else 1 if source.startswith('PDF') else 2
+        candidates.append((rank, label_priority(lab.kind), d, lab))
     if not candidates:
-        return None, "", ""
-    candidates.sort(key=lambda t: (t[0], t[1], t[2]))
-    pr, _, d, best = candidates[0]
-    prefix = "PDF C-5.0 spot" if best.source.upper().startswith("PDF") else "CAD spot"
-    if best.kind == "FL":
-        return best.elev + default_curb_height, f"{prefix} FL plus curb height, {d:.1f} ft away, from {best.raw}", "HIGH"
-    if best.kind in ("TC", "BC", "HP", "LP", "HP_TC", "LP_TC"):
-        return best.elev, f"{prefix} {best.kind} HELD AS TOP/BACK OF CURB, {d:.1f} ft away, from {best.raw}", "HIGH"
-    if best.kind in ("FG", "SPOT"):
-        return best.elev, f"{prefix} {best.kind}, {d:.1f} ft away, from {best.raw}", "MEDIUM"
-    return best.elev, f"{prefix} grade label {best.kind}, {d:.1f} ft away, from {best.raw}", "MEDIUM"
+        return None, '', ''
+    candidates.sort(key=lambda item: item[:3])
+    _rank, _kind, d, best = candidates[0]
+    z = best.elev + default_curb_height if best.kind == 'FL' else best.elev
+    # Keep the actual source, not a fabricated CAD label for a manual PDF hold.
+    src = f"{best.source}; {best.kind} HELD CONTROL from {best.raw}; distance {d:.3f} ft"
+    conf = 'HELD_CONTROL' if d <= 0.35 else 'LABEL_REVIEW'
+    # Conflicting equally located controls must be resolved by the operator.
+    same = [item[3] for item in candidates if item[:2] == candidates[0][:2] and abs(item[2]-d) <= 1e-6]
+    if any(abs(lab.elev-best.elev) > 1e-6 for lab in same):
+        return None, src + '; conflicting held controls', 'CONTROL_CONFLICT_REVIEW'
+    return float(z), src, conf
 
 
 
@@ -2536,6 +2578,8 @@ def sidewalk_cross_slope_auto_adjust(p: Point2, elev: Optional[float], src: str,
         delta = 0.0
     if delta <= 0 or m.startswith('direct'):
         return elev, src
+    if m.startswith('auto') and ('MANUAL' in src.upper() or 'HELD CONTROL' in src.upper() or 'LANDXML' in src.upper()):
+        return elev, src + '; held design grade retained'
     if m.startswith('add'):
         return elev + delta, src + f"; sidewalk cross slope +{delta:.3f} ft"
     if m.startswith('subtract'):
@@ -2626,7 +2670,7 @@ def enforce_sidewalk_cross_slope_pairs(points: List[Point2], elevs: List[Tuple[O
             out[j][1] = (out[j][1] or '') + note
             continue
         msg = f"Review: edge-to-edge sidewalk cross slope {slope_pct:.2f}% over {dist:.2f} ft exceeds max {max_slope_percent:.2f}%."
-        if auto_enforce:
+        if auto_enforce and not (held_result(out[i][3],out[i][1]) or held_result(out[j][3],out[j][1]) or 'LANDXML' in (out[i][1]+out[j][1]).upper()):
             # Preserve the lower edge for drainage and clamp the higher edge to lower + allowed.
             if float(zi) > float(zj):
                 newz = float(zj) + allowed
@@ -2690,7 +2734,9 @@ def build_contour_tin_surface(segments: List[ElevSegment], max_segment_sample: f
         buckets.setdefault(key, []).append(z)
     pts=[]; zs=[]
     for (x,y), zlist in buckets.items():
-        pts.append((x,y)); zs.append(sum(zlist)/len(zlist))
+        if max(zlist) - min(zlist) > 1e-6:
+            return None
+        pts.append((x,y)); zs.append(zlist[0])
     if len(pts) < 3:
         return None
     arr = _np.array(pts, dtype=float)
@@ -2893,75 +2939,42 @@ def contour_elevation(p: Point2, segments: List[ElevSegment], radius: float, nea
 
 
 def local_contour_prorated_elevation(p: Point2, segments: List[ElevSegment], radius: float, near_hold_tol: float = 1.50) -> Tuple[Optional[float], str, str, float]:
-    """Survey-style local contour interpolation for 2D curb gaps.
+    """Only interpolate when contour projections geometrically bracket the point.
 
-    This is used only when the stronger selected-BC / selected-FL chain controls do
-    not bracket the point.  It keeps the field output from staying at 0.000 when
-    the point is clearly controlled by nearby 3D contour polylines.
-
-    Rules:
-    - Use only real contour layers with valid Z values.
-    - If a valid contour is essentially on the point, hold that contour exactly.
-    - Otherwise find the nearest lower and higher contour elevations and prorate
-      by distance to those contour lines. This is interpolation, not blind averaging.
-    - If the point cannot be bracketed by clean contours, return None so the normal
-      safety rule can still export 0.000.
+    No project-elevation or contour-interval assumptions. Near-but-not-on values
+    remain review evidence; exact contacts use the existing 0.35-foot direct gate.
     """
-    if not segments:
-        return None, "no contour segments available for local prorating", "", 0.0
-    by_z: Dict[float, Tuple[float, ElevSegment]] = {}
+    hits = []
     for seg in segments:
         if not is_contour_layer_name(seg.layer):
             continue
-        z = float(segment_z_at_point(p, seg))
-        # Reject known placeholder and wild values.  Real project contours should
-        # already be sanitized, but keep this guard for safety.
-        if abs(z) < 1e-9 or z < 100.0 or z > 2000.0:
-            continue
-        d = point_segment_distance(p, seg.a, seg.b)
-        if d > radius:
-            continue
-        rz = round(z, 3)
-        if rz not in by_z or d < by_z[rz][0]:
-            by_z[rz] = (d, seg)
-    if not by_z:
-        return None, f"no valid 3D contour within {radius:.1f} ft for local prorating", "", 0.0
-
-    # Direct or near-direct contour hold. This catches cases where the contour is
-    # within drafting tolerance of the picked BC line but the exact intersection failed.
-    nearest_z, (nearest_d, nearest_seg) = min(by_z.items(), key=lambda kv: kv[1][0])
-    if nearest_d <= near_hold_tol:
-        return float(nearest_z), f"LOCAL CONTOUR HOLD: {nearest_z:.3f} contour within {nearest_d:.2f} ft of selected BC point on {nearest_seg.layer}", "LOCAL_CONTOUR_HOLD", nearest_d
-
-    # Bracket the point between the nearest lower and upper contours.
-    zs = sorted(by_z.keys())
-    # The point does not have its own Z yet, so use distance-based bracketing:
-    # choose the nearest pair with different elevations and reasonable spacing.
-    best = None
-    for i, zlo in enumerate(zs):
-        dlo, seglo = by_z[zlo]
-        for zhi in zs[i+1:]:
-            dhi, seghi = by_z[zhi]
-            dz = zhi - zlo
-            if dz <= 0 or dz > 5.0:
+        _t, q, d = closest_point_t_on_segment(p, seg.a, seg.b)
+        z = segment_z_at_point(q, seg)
+        if valid_grade_z(z) and d <= radius:
+            hits.append((d, z, q, seg))
+    if not hits:
+        return None, 'No valid local contours.', '', 0.0
+    hits.sort(key=lambda h: h[0])
+    d, z, _q, seg = hits[0]
+    if d <= min(0.35, near_hold_tol):
+        return z, f'Exact local contour at {seg.layer}', 'LOCAL_CONTOUR_HOLD', d
+    pairs = []
+    for i, a in enumerate(hits):
+        for b in hits[i+1:]:
+            if abs(a[1]-b[1]) <= 1e-9:
                 continue
-            total = dlo + dhi
-            if total <= 1e-9:
+            va = (a[2][0]-p[0], a[2][1]-p[1])
+            vb = (b[2][0]-p[0], b[2][1]-p[1])
+            # Opposite projections and point on their joining segment, not merely
+            # two different elevation numbers on the same side of the point.
+            if va[0]*vb[0]+va[1]*vb[1] >= 0 or point_segment_distance(p, a[2], b[2]) > 1e-6:
                 continue
-            # Prefer close, adjacent contour pairs.  Do not use two far-away contours.
-            score = total + dz * 2.0
-            if best is None or score < best[0]:
-                best = (score, zlo, zhi, dlo, dhi, seglo, seghi)
-    if best is None:
-        return None, "valid contours found, but no clean lower/upper bracket for local prorating", "", nearest_d
-    _score, zlo, zhi, dlo, dhi, seglo, seghi = best
-    # Distance weighted linear interpolation between contour lines:
-    # on low contour = zlo, on high contour = zhi.
-    z = zlo + (dlo / max(dlo + dhi, 1e-9)) * (zhi - zlo)
-    src = (f"LOCAL CONTOUR PRORATE: interpolated between {zlo:.3f} contour "
-           f"({dlo:.2f} ft away on {seglo.layer}) and {zhi:.3f} contour "
-           f"({dhi:.2f} ft away on {seghi.layer})")
-    return float(z), src, "LOCAL_CONTOUR_PRORATE", min(dlo, dhi)
+            pairs.append((a[0]+b[0], a, b))
+    if not pairs:
+        return None, 'Local contours do not spatially bracket point.', 'LOCAL_CONTOUR_REVIEW', d
+    _span, a, b = min(pairs, key=lambda v: v[0])
+    z = a[1] + a[0]/(a[0]+b[0])*(b[1]-a[1])
+    return z, f'Local contour bracket {a[1]:.3f} / {b[1]:.3f}', 'LOCAL_CONTOUR_PRORATE', min(a[0], b[0])
 
 def is_flowline_or_gutter_source(src: str) -> bool:
     """Detect elevation sources that are explicitly flowline/gutter/face-of-curb.
@@ -2986,55 +2999,19 @@ def is_back_curb_source(src: str) -> bool:
     return any(t in n for t in terms)
 
 
-def contour_bc_rule(p: Point2, celev: Optional[float], csrc: str, cconf: str, nearest_d: float, default_curb_height: float, surface_mode: str = "bc") -> Tuple[Optional[float], str, str, str]:
-    """Convert secondary contour/surface evidence into a BC elevation.
-
-    IMPORTANT surveying rule:
-    - If the source is TC/BC/top/back of curb, use it directly.
-    - If the source is FL/gutter/pavement/typical Civil 3D surface, add curb height.
-    - If set to Auto, only add when the layer/source text says FL/gutter/face of curb.
-    """
+def contour_bc_rule(p, celev, csrc, cconf, nearest_d, default_curb_height, surface_mode='bc'):
     if celev is None:
-        return None, csrc, cconf, ""
-
-    mode = (surface_mode or "bc").strip().lower()
-
-    if mode.startswith("bc") or mode.startswith("top") or mode.startswith("back"):
-        return celev, csrc + " treated as top/back of curb, used directly", cconf if cconf else "CONTOUR_BC", ""
-
-    # v8.4.6: selected BC direct-contour override.
-    # If the contour evidence is physically on or very close to the selected BC point,
-    # use the plotted contour elevation directly. Do NOT add curb height just because
-    # the global surface mode says flowline/pavement. This fixes short contour/curb
-    # gaps where the PDF/DXF clearly shows a 610 contour at the BC but the linework
-    # stops just short of an actual mathematical intersection.
-    near_bc_direct = (nearest_d is not None and nearest_d <= 2.50 and
-                      not is_flowline_or_gutter_source(csrc) and
-                      ("CONTOUR" in (csrc or "").upper() or "LOCAL_CONTOUR" in (cconf or "").upper() or "BC_STOP_SHORT" in (cconf or "").upper()))
-    if near_bc_direct:
-        warn = (f"v8.4.6 held nearby contour directly at selected BC because it is within {nearest_d:.2f} ft. "
-                "No curb height was added. Review only if this contour is actually FL/gutter rather than BC.")
-        return celev, csrc + " treated as nearby/short-gap selected BC contour, used directly", cconf if cconf else "CONTOUR_BC_DIRECT_NEAR", warn
-
-    if mode.startswith("flow") or mode.startswith("gutter") or mode.startswith("pavement"):
-        if is_back_curb_source(csrc):
-            return celev, csrc + " explicitly looks like BC/top curb, used directly", cconf if cconf else "CONTOUR_BC", ""
-        return celev + default_curb_height, csrc + f" treated as FL/gutter/pavement surface plus curb height {default_curb_height:.2f}", "SURFACE_PLUS_CURB", ""
-
-    # Auto mode. Use layer/source wording first, then distance confidence.
-    if is_flowline_or_gutter_source(csrc):
-        if not CURRENT_CURB_HEIGHT_VERIFIED_FROM_PDF:
-            return None, csrc + " interpreted as FL/gutter but no PDF verified curb height", "FL_HEIGHT_NOT_VERIFIED", "No PDF verified curb height. Elevation zeroed for review."
-        return celev + default_curb_height, csrc + f" interpreted as FL/gutter plus PDF verified curb height {default_curb_height:.2f}", "FL_CONTOUR", ""
+        return None, csrc, cconf, ''
+    mode = (surface_mode or '').lower()
+    if mode.startswith(('bc', 'top', 'back')):
+        return celev, csrc + '; explicit top/back grade interpretation', cconf, ''
+    if mode.startswith(('flow', 'gutter', 'pavement')):
+        return celev + default_curb_height, csrc + f'; explicit FL/pavement + curb {default_curb_height:.3f}', cconf, ''
     if is_back_curb_source(csrc):
-        return celev, csrc + " interpreted as BC/top curb, used directly", cconf if cconf else "CONTOUR_BC", ""
-    if nearest_d <= 0.35:
-        warn = ("Auto mode used this contour/surface directly because it touches the BC point. "
-                "Review if the Civil surface is really pavement/flowline instead of top back of curb.")
-        return celev, csrc + " interpreted as contour/surface at BC, used directly", cconf if cconf else "CONTOUR_BC", warn
-    warn = (f"Secondary contour/surface is {nearest_d:.2f} ft from BC and is not labeled FL/gutter or BC. "
-            f"GradeGuard used it directly in Auto mode, but review because a nearby contour could be on pavement, gutter, or grass.")
-    return celev, csrc + " interpreted as nearby contour/surface, direct only", "LOW_CONTOUR", warn
+        return celev, csrc, cconf, ''
+    if is_flowline_or_gutter_source(csrc) and CURRENT_CURB_HEIGHT_VERIFIED_FROM_PDF:
+        return celev + default_curb_height, csrc + f'; FL + confirmed curb {default_curb_height:.3f}', cconf, ''
+    return celev, csrc, 'SURFACE_MEANING_REVIEW', 'Review required: select top/back grade or flowline/pavement meaning for this surface.'
 
 
 
@@ -3303,7 +3280,7 @@ def curb_chain_contour_elevation(p: Point2, elev_segments: List[ElevSegment], se
     if not CURB_SEGMENTS or not elev_segments:
         return None, "no selected BC contour chain available", "", 0.0
     # v8.4.9: station on the local curb run/component, not all selected curbs as one chain.
-    local_curb_segments = _local_curb_segments_for_point(p)
+    local_curb_segments = safe_local_curb_chain(p)
     if not local_curb_segments:
         return None, "no local selected BC component found", "", 1e99
     p_station, p_q, p_d, p_idx = _chain_station_for_point_on_segments(p, local_curb_segments)
@@ -3327,62 +3304,7 @@ def curb_chain_contour_elevation(p: Point2, elev_segments: List[ElevSegment], se
             anchors.append((st, float(z), q, f"{z:.3f} exact contour crossing selected BACK OF CURB on {es.layer}", "BC_CONTOUR_EXACT"))
         cum += L
 
-    # v8.4.6 short-gap BC contour anchors.
-    # Real plan linework often stops just short of a true CAD intersection. If a contour
-    # endpoint is within a small gap of the selected BC, or a selected BC endpoint is
-    # within a small gap of a contour segment, treat that as a BC contour control.
-    # This is direct BC elevation. No curb height is added.
-    short_gap = min(6.0, max(2.5, search_radius * 0.06))
-    cum = 0.0
-    for i, cs in enumerate(local_curb_segments):
-        L = max(dist(cs.a, cs.b), 1e-12)
-        for es in contour_segments:
-            # contour endpoint stops short of BC
-            for ep in (es.a, es.b):
-                t_bc, q_bc, d_bc = closest_point_t_on_segment(ep, cs.a, cs.b)
-                if d_bc <= short_gap:
-                    z = segment_z_at_point(ep, es)
-                    st = cum + max(0.0, min(1.0, t_bc)) * L
-                    anchors.append((st, float(z), q_bc, f"{z:.3f} short-gap contour endpoint projected to selected BACK OF CURB on {es.layer}; gap {d_bc:.2f} ft", "BC_STOP_SHORT_CONTOUR_DIRECT"))
-            # selected BC endpoint stops short of contour
-            for t_bc_end, bc_ep in ((0.0, cs.a), (1.0, cs.b)):
-                t_con, q_con, d_con = closest_point_t_on_segment(bc_ep, es.a, es.b)
-                if d_con <= short_gap:
-                    z = segment_z_at_point(q_con, es)
-                    st = cum + t_bc_end * L
-                    anchors.append((st, float(z), bc_ep, f"{z:.3f} selected BACK OF CURB endpoint projected to nearby contour on {es.layer}; gap {d_con:.2f} ft", "BC_STOP_SHORT_CONTOUR_DIRECT"))
-        cum += L
-
-    # v8.4.9 near-point contour anchor:
-    # If the BC point itself is within a tight tolerance of a contour segment, hold
-    # that contour directly at this station.  This catches cases where CAD linework
-    # stops a hair short or contours are slightly offset from the picked BC.
-    near_point_tol = max(0.20, min(0.35, search_radius * 0.01))
-    near_point_candidates = []
-    for es in contour_segments:
-        d_np = point_segment_distance(p, es.a, es.b)
-        if d_np <= near_point_tol:
-            _t_np, q_np, _d_np2 = closest_point_t_on_segment(p, es.a, es.b)
-            z_np = float(segment_z_at_point(q_np, es))
-            near_point_candidates.append((d_np, p_station, z_np, p_q, es.layer))
-    if near_point_candidates:
-        near_point_candidates.sort(key=lambda c: c[0])
-        d_np, st_np, z_np, q_np, layer_np = near_point_candidates[0]
-        anchors.append((
-            st_np,
-            z_np,
-            q_np if q_np is not None else p,
-            f"{z_np:.3f} near-point contour projected to selected BACK OF CURB on {layer_np}; gap {d_np:.2f} ft",
-            "BC_NEAR_POINT_CONTOUR_DIRECT",
-        ))
-
-    # v8.4.9 endpoint extension:
-    # If the curb stops short but a contour is clearly just beyond the local curb end,
-    # hold that contour at the curb endpoint.  This is a direct BC contour control.
-    endpoint_anchor = _chain_endpoint_extension_anchor(p, local_curb_segments, contour_segments, search_radius)
-    if endpoint_anchor is not None:
-        anchors.append(endpoint_anchor)
-
+    # Projected near/short-gap contours cannot become approved interpolation anchors.
     # FL/gutter intersections: project crossing to BC and add PDF verified curb height.
     if FLOWLINE_SEGMENTS:
         for fs in FLOWLINE_SEGMENTS:
@@ -3395,7 +3317,7 @@ def curb_chain_contour_elevation(p: Point2, elev_segments: List[ElevSegment], se
                 if q_bc is None:
                     continue
                 st, q_proj, d_proj, idx = _chain_station_for_point_on_segments(q_bc, local_curb_segments)
-                if st is None:
+                if st is None or d_proj > 1e-6:
                     continue
                 z_fl = segment_z_at_point(q_fl, es)
                 z_bc = float(z_fl) + float(default_curb_height)
@@ -3426,7 +3348,9 @@ def curb_chain_contour_elevation(p: Point2, elev_segments: List[ElevSegment], se
 
     for a in anchors:
         if ded and abs(a[0]-ded[-1][0]) <= 0.05:
-            # Prefer direct BC/short-gap BC contour over FL projected at the same station.
+            if _anchor_priority(a) == _anchor_priority(ded[-1]) and abs(a[1] - ded[-1][1]) > 1e-6:
+                return None, 'Conflicting contour grades at the same curb station; review required.', 'CONTROL_CONFLICT_REVIEW', 0.0
+            # Prefer an actual BC intersection over the converted FL control.
             if _anchor_priority(a) < _anchor_priority(ded[-1]):
                 ded[-1] = a
         else:
@@ -3464,148 +3388,64 @@ def curb_chain_contour_elevation(p: Point2, elev_segments: List[ElevSegment], se
         return direct[1], direct[3] + " one-sided curb-component contour fallback, review", "LOW_BC_CHAIN_CONTOUR", direct_dist_station
     return None, "curb-component contour anchors exist but do not bracket this point", "", direct_dist_station
 
-def assign_elevations(points: List[Point2], labels: List[GradeLabel], segments: List[ElevSegment], default_curb_height: float, label_radius: float, contour_radius: float, add_curb_height_to_contours: bool, contour_check_tolerance: float = 0.15, landxml_surface: Optional[LandXMLSurface] = None, surface_mode: str = "bc", contour_tin: Optional[ContourTinSurface] = None) -> List[Tuple[Optional[float], str, str, str]]:
-    assigned = []
+def assign_elevations(points, labels, segments, default_curb_height, label_radius, contour_radius,
+                      add_curb_height_to_contours, contour_check_tolerance=0.15, landxml_surface=None,
+                      surface_mode='bc', contour_tin=None, source_policy='surface', curb_controls=True):
+    """Assign once under an explicit source policy; later passes cannot redesign grades."""
+    out = []
+    def surface_result(p):
+        z, src, conf = landxml_elevation_at(p, landxml_surface, search_pad=max(5, min(contour_radius,25)))
+        if z is None:
+            return None, src, 'Review required: selected LandXML does not cover this point.', 'SURFACE_REVIEW'
+        z, src, conf, issue = contour_bc_rule(p,z,src,conf,0,default_curb_height,surface_mode)
+        return z, src, issue, conf
     for p in points:
-        # Primary: C-5.0/PDF or CAD spot callouts. TC/BC/HP/LP hold the BC elevation.
-        elev, src, conf = nearest_label_elevation(p, labels, default_curb_height, label_radius)
-        exact_override = get_contour_point_override(p)
-        # Secondary 1: true Civil 3D/LandXML TIN surface if supplied.
-        # This is the preferred non-PDF source because it is the actual design model, not plotted text.
-        selev, ssrc, sconf = landxml_elevation_at(p, landxml_surface, search_pad=max(5.0, min(contour_radius, 25.0)))
-
-        # Secondary 1B: if no XML surface exists, build/use a temporary TIN from 3D DXF contours.
-        # This lets 2D curb workflows prorate between contour elevations instead of snapping to nearest contour.
-        tin_elev = tin_src = tin_conf = None
-        if selev is None and contour_tin is not None:
-            tin_elev, tin_src, tin_conf = contour_tin_elevation(p, contour_tin)
-
-        # Secondary 1C: strongest 2D contour method for curbs.  It builds controls from
-        # actual contour crossings on the picked BC and picked FL/gutter lines, then
-        # prorates along the selected BC chain.  This must beat the temporary TIN.
-        chain_elev, chain_src, chain_conf, chain_d = curb_chain_contour_elevation(p, segments, contour_radius, default_curb_height)
-
-        # Secondary 1D: local survey-style contour interpolation.  This fills small
-        # gaps where exact BC/FL intersections missed due to exploded CAD geometry,
-        # while still returning None when the point cannot be bracketed safely.
-        local_elev, local_src, local_conf, local_d = local_contour_prorated_elevation(p, segments, max(contour_radius, 35.0))
-
-        # Secondary 2: contours/surface that actually touch the selected BC layer.
-        # This prevents a nearby contour from being used when it does not cross the BC line.
-        belev, bsrc, bconf, bd = bc_touching_elevation(p, segments, contour_radius, default_curb_height)
-        if belev is not None:
-            celev_for_check, csrc_for_check, cconf_for_check, contour_rule_warn = contour_bc_rule(p, belev, bsrc, bconf, bd, default_curb_height, "bc")
-            nearest_d = bd
-            felev = fsrc = fconf = None; fd = 0.0
-        else:
-            felev, fsrc, fconf, fd = flowline_touching_elevation(p, segments, contour_radius, default_curb_height)
-            if felev is not None:
-                celev_for_check, csrc_for_check, cconf_for_check, contour_rule_warn = felev, fsrc, fconf, ""
-                nearest_d = fd
-            else:
-                celev, csrc, cconf, nearest_d = contour_elevation(p, segments, contour_radius)
-                celev_for_check, csrc_for_check, cconf_for_check, contour_rule_warn = contour_bc_rule(p, celev, csrc, cconf, nearest_d, default_curb_height, surface_mode)
-
-        if elev is not None:
-            # Spot/callout anchors hold first, but surface and contour are QA checks.
-            if chain_elev is not None:
-                celev_for_check, csrc_for_check, cconf_for_check, contour_rule_warn = chain_elev, chain_src, chain_conf, ""
-            elif local_elev is not None:
-                celev_for_check, csrc_for_check, cconf_for_check, contour_rule_warn = local_elev, local_src, local_conf, ""
-            elif selev is not None:
-                celev_for_check, csrc_for_check, cconf_for_check, contour_rule_warn = contour_bc_rule(p, selev, ssrc, sconf, 0.0, default_curb_height, surface_mode)
-            elif tin_elev is not None:
-                celev_for_check, csrc_for_check, cconf_for_check, contour_rule_warn = contour_bc_rule(p, tin_elev, tin_src, tin_conf, 0.0, default_curb_height, surface_mode)
-            issue = ""
-            if celev_for_check is not None:
-                diff = abs(float(elev) - float(celev_for_check))
-                # The spot still holds. The contour is only a check.
-                if diff > contour_check_tolerance:
-                    issue = (
-                        f"Secondary contour check differs from held spot by {diff:.2f} ft. "
-                        f"Spot elevation is primary and was held. Review contour/surface near curb. "
-                        f"Contour source: {csrc_for_check}"
-                    )
-                elif contour_rule_warn:
-                    issue = contour_rule_warn + " Spot elevation still held."
-            assigned.append((elev, src, issue, conf))
+        z, src, conf = nearest_label_elevation(p, labels, default_curb_height, label_radius)
+        if z is not None or conf == 'CONTROL_CONFLICT_REVIEW':
+            out.append((z,src,'' if conf == 'HELD_CONTROL' else 'Review required: confirm the control location/value.',conf))
             continue
-
-        if exact_override is not None:
-            oelev, osrc, oconf, oissue = exact_override
-            assigned.append((oelev, osrc, oissue, oconf))
-            continue
-
-        if chain_elev is not None and (chain_conf or "").upper() in ("BC_CONTOUR_EXACT", "FL_CONTOUR_PLUS_CURB_EXACT", "BC_CHAIN_CONTOUR_INTERP", "BC_CHAIN_CONTOUR_REVIEW"):
-            issue = "Elevation calculated from selected curb-component contour controls. "
-            src_upper = (chain_src or "").upper()
-            if (chain_conf or "").upper() == "FL_CONTOUR_PLUS_CURB_EXACT":
-                issue += "Exact contour hit selected FLOWLINE/GUTTER/EP, so GradeGuard added verified curb height to compute BC. "
-            elif (chain_conf or "").upper() == "BC_CONTOUR_EXACT":
-                issue += "Exact contour hit selected BACK OF CURB, so GradeGuard used contour elevation directly. "
-            elif "FLOWLINE/GUTTER" in src_upper and "BACK OF CURB" in src_upper:
-                issue += "Interpolated/prorated along BC between BC-equivalent contour controls. FL/gutter controls were first converted to BC using the verified curb height, then the point was prorated between controls. "
-            elif "FLOWLINE/GUTTER" in src_upper:
-                issue += "Interpolated/prorated along BC from FL/gutter contour controls after adding the verified curb height. Review if catch/spill/header curb height changes in this area. "
-            elif "BACK OF CURB" in src_upper:
-                issue += "Interpolated/prorated along BC between exact BC contour crossings. "
-            if "REVIEW" in (chain_conf or ""):
-                issue += "Review this point because the adjacent contour controls create a steep curb profile. "
-            assigned.append((chain_elev, chain_src, issue, chain_conf))
-            continue
-
-        # No usable spot callout nearby. For 2D curb workflows, actual contour touches
-        # on the selected BC or selected FL/gutter must beat the temporary TIN.
-        # This preserves the survey rule: contour on BC = exact elevation; contour on
-        # FL/gutter/EP = contour elevation plus verified curb height.
-        if celev_for_check is not None and (cconf_for_check or "").upper() in ("BC_TOUCH", "BC_TOUCH_INTERP", "FL_TOUCH_PLUS_CURB", "FL_TOUCH_INTERP_PLUS_CURB"):
-            issue = "Elevation calculated from contour crossing selected curb component because no held TC/BC/HP/LP/FL/FG spot callout was found nearby. "
-            if cconf_for_check and "FL_TOUCH" in cconf_for_check:
-                issue += "Contour touched selected FLOWLINE/GUTTER/EP, so GradeGuard added curb height to compute BC. "
-            elif cconf_for_check and "BC_TOUCH" in cconf_for_check:
-                issue += "Contour touched selected BACK OF CURB, so GradeGuard used the contour elevation directly. "
-            if contour_rule_warn:
-                issue += contour_rule_warn
-            assigned.append((celev_for_check, csrc_for_check, issue, cconf_for_check or "CONTOUR_TOUCH"))
-        elif local_elev is not None and (local_conf or "").upper() in ("LOCAL_CONTOUR_HOLD", "LOCAL_CONTOUR_PRORATE"):
-            issue = "Elevation calculated by local survey-style contour interpolation because exact selected BC/FL contour chain controls did not bracket this point. "
-            issue += "This uses nearby 3D contour polylines and prorates by distance between contour elevations; review against the certified PDF if callouts exist. "
-            assigned.append((local_elev, local_src, issue, local_conf))
-        elif selev is not None:
-            selev_bc, ssrc_bc, sconf_bc, swarn = contour_bc_rule(p, selev, ssrc, sconf, 0.0, default_curb_height, surface_mode)
-            issue = "Elevation calculated from LandXML/TIN design surface because no held TC/BC/HP/LP/FL/FG spot callout or picked curb-component contour touch was found nearby. Use PDF C-5.0 as QA check. "
-            if swarn:
-                issue += swarn
-            assigned.append((selev_bc, ssrc_bc, issue, sconf_bc or "SURFACE"))
-        elif tin_elev is not None:
-            tin_bc, tin_src_bc, tin_conf_bc, tin_warn = contour_bc_rule(p, tin_elev, tin_src, tin_conf, 0.0, default_curb_height, surface_mode)
-            issue = "Elevation calculated from temporary TIN built from 3D DXF contours because no held TC/BC/HP/LP/FL/FG spot callout, LandXML surface, or picked BC/FL contour touch was found. "
-            issue += "This prorates between contour elevations and is fallback behind actual BC/FL contour intersections. "
-            if tin_warn:
-                issue += tin_warn
-            assigned.append((tin_bc, tin_src_bc, issue, tin_conf_bc or "TIN_CONTOUR"))
-        elif celev_for_check is not None:
-            issue = "Elevation calculated from secondary contour/surface source because no stronger source was found nearby. "
-            if cconf_for_check and "FL_TOUCH" in cconf_for_check:
-                issue += "Contour touched selected FLOWLINE/GUTTER, so GradeGuard added curb height to compute BC. "
-            elif cconf_for_check and "BC_TOUCH" in cconf_for_check:
-                issue += "Contour touched selected BACK OF CURB, so GradeGuard used the contour elevation directly. "
-            if contour_rule_warn:
-                issue += contour_rule_warn
-            else:
-                issue += "Contour/surface rule applied. Review before final staking."
-            assigned.append((celev_for_check, csrc_for_check, issue, cconf_for_check or "CONTOUR"))
-        else:
-            assigned.append((None, csrc or "no grade label or contour source found", "Missing calculated elevation. Review CAD/PDF spot grades or surface.", ""))
-    return assigned
+        override = get_contour_point_override(p) if curb_controls else None
+        if override:
+            z,src,conf,issue = override
+            out.append((z,src,issue,conf)); continue
+        if landxml_surface is not None and source_policy == 'surface':
+            out.append(surface_result(p)); continue
+        if source_policy == 'dxf_surface':
+            surface_segments = [es for es in segments if is_surface_layer(es.layer)]
+            z,src,conf,d = contour_elevation(p,surface_segments,contour_radius)
+            if z is not None and d <= 0.25:
+                z,src,conf,issue = contour_bc_rule(p,z,src,'FEATURELINE_HIGH',d,default_curb_height,surface_mode)
+                out.append((z,src,issue,conf)); continue
+        if curb_controls:
+            z,src,conf,_d = curb_chain_contour_elevation(p,segments,contour_radius,default_curb_height)
+            if conf == 'CONTROL_CONFLICT_REVIEW':
+                out.append((None,src,'Review required: conflicting contour controls.',conf)); continue
+            if z is not None and conf in ('BC_CONTOUR_EXACT','FL_CONTOUR_PLUS_CURB_EXACT','BC_CHAIN_CONTOUR_INTERP'):
+                out.append((z,src,'',conf)); continue
+        if source_policy == 'contours':
+            out.append((None,'No bracketing selected curb contour controls','Review required: contours-only mode has no approved control.','CONTOUR_REVIEW')); continue
+        if landxml_surface is not None:
+            out.append(surface_result(p)); continue
+        z,src,conf,d = local_contour_prorated_elevation(p,segments,contour_radius)
+        if z is not None:
+            # Unconstrained local estimates remain office-review evidence. Actual
+            # curb crossings and connected station controls are handled above.
+            out.append((z,src,'Review required: local contour estimate is not an approved surface/control.','LOCAL_CONTOUR_REVIEW')); continue
+        z,src,conf = contour_tin_elevation(p,contour_tin)
+        if z is not None:
+            out.append((z,src,'Review required: temporary contour TIN has no approved boundaries/breaklines.','TIN_REVIEW')); continue
+        z,src,conf,_d = contour_elevation(p,segments,contour_radius)
+        out.append((z,src,'Review required: nearby contour fallback is not a field elevation.','CONTOUR_REVIEW'))
+    return out
 
 def add_flow_warnings(points: List[GenPoint], min_slope: float = 0.003, max_gap: float = 55.0):
     # This is a first pass. It flags flat pairs only when consecutive generated points are close enough to be likely on the same run.
-    for a, b in zip(points[:-1], points[1:]):
+    for a, b, d in diagnostic_pairs(points):
         if a.elevation is None or b.elevation is None:
             continue
-        d = dist((a.easting, a.northing), (b.easting, b.northing))
         if d <= 0.1 or d > max_gap:
+            continue
+        if CURB_SEGMENTS and not same_curb_run((a.easting,a.northing),(b.easting,b.northing)):
             continue
         slope = abs(b.elevation - a.elevation) / d
         if slope < min_slope:
@@ -3702,7 +3542,7 @@ def make_offset_points(points: List[GenPoint], offset_distance: float, mode: str
         ox = p[0] + direction[0] * offset_distance
         oy = p[1] + direction[1] * offset_distance
         issue = f"Offset point {offset_distance:.2f} ft from true BC. Draw line back to BC. {note}"
-        op = GenPoint(point=next_pt, northing=oy, easting=ox, elevation=bc.elevation, desc=bc.desc, source="Offset from BC", issue=issue, confidence="OFFSET")
+        op = GenPoint(point=next_pt, northing=oy, easting=ox, elevation=bc.elevation, desc=bc.desc, source="Offset from BC", issue=issue, confidence="OFFSET", approved=field_approval(bc)[0])
         offsets.append(op)
         pairs.append((bc, op, note))
         next_pt += 1
@@ -3822,7 +3662,7 @@ def hard_lock_hp_lp_callout_elevations(points: List[GenPoint], labels: List[Grad
             z = float(lab.elev)
         except Exception:
             continue
-        if abs(z) < 1e-9 or z < 100.0 or z > 2000.0:
+        if not valid_grade_z(z):
             continue
         lx, ly = float(lab.x), float(lab.y)
         best = None
@@ -3841,6 +3681,7 @@ def hard_lock_hp_lp_callout_elevations(points: List[GenPoint], labels: List[Grad
         used_point_ids.add(id(best))
         is_hp = _is_hp_label_kind(lab.kind)
         best.elevation = z
+        best.locked = True
         best.desc = 'BC HP' if is_hp else 'BC LP'
         best.source = (best.source + '; ' if best.source else '') + (
             f"v8.4.8 HP/LP HARD HOLD: {lab.kind} callout held exact elevation {z:.3f} "
@@ -3893,7 +3734,7 @@ def fill_missing_bc_elevations_by_station_interpolation(points: List[GenPoint], 
             z = float(gp.elevation)
         except Exception:
             continue
-        if abs(z) < 1e-9 or z < 100.0 or z > 2000.0:
+        if not valid_grade_z(z):
             continue
 
         txt = " ".join([(gp.confidence or "").upper(), (gp.source or "").upper(), (gp.issue or "").upper()])
@@ -3934,7 +3775,10 @@ def fill_missing_bc_elevations_by_station_interpolation(points: List[GenPoint], 
 
         # Direct/near hold first.  This catches a PC/PT/25-ft point sitting almost
         # exactly on a contour crossing point generated from the same selected BC.
-        nearest = min(anchors, key=lambda a: abs(a[0] - st))
+        local_anchors = [a for a in anchors if same_curb_run((gp.easting,gp.northing),(a[3].easting,a[3].northing))]
+        if not local_anchors:
+            continue
+        nearest = min(local_anchors, key=lambda a: abs(a[0] - st))
         near_sta = abs(nearest[0] - st)
         if near_sta <= max_near_hold_station:
             gp.elevation = nearest[1]
@@ -3949,8 +3793,8 @@ def fill_missing_bc_elevations_by_station_interpolation(points: List[GenPoint], 
             filled += 1
             continue
 
-        before = [a for a in anchors if a[0] < st]
-        after = [a for a in anchors if a[0] > st]
+        before = [a for a in anchors if a[0] < st and same_curb_run((gp.easting,gp.northing),(a[3].easting,a[3].northing))]
+        after = [a for a in anchors if a[0] > st and same_curb_run((gp.easting,gp.northing),(a[3].easting,a[3].northing))]
         if not before or not after:
             continue
 
@@ -4060,7 +3904,7 @@ def is_hp_lp_or_manual_locked_point(gp: GenPoint) -> bool:
     locked_tokens = [
         "BC HP", "BC LP", "HP_TC", "LP_TC", "HIGH POINT", "LOW POINT",
         "HP/LP CALLOUT", "HP_HARD_HOLD", "LP_HARD_HOLD",
-        "MANUAL", "PDF_TICK", "PDF LEADER", "PDF_SPOT"
+        "MANUAL", "PDF_TICK", "PDF LEADER", "PDF_SPOT", "HELD_CONTROL", "HELD CONTROL"
     ]
     return any(tok in txt for tok in locked_tokens)
 
@@ -4123,7 +3967,7 @@ def protect_close_hp_lp_clusters_v857(points: List[GenPoint], cluster_tol: float
                 z = float(gp.elevation)
             except Exception:
                 continue
-            if abs(z) > 1e-9 and 100.0 <= z <= 2000.0:
+            if valid_grade_z(z):
                 controls.append(gp)
 
     if not controls:
@@ -4220,7 +4064,7 @@ def force_nearby_contour_direct_holds_v850(points: List[GenPoint], elev_segments
                 z = float(segment_z_at_point(q, es))
             except Exception:
                 continue
-            if abs(z) < 1e-9 or z < 100.0 or z > 2000.0:
+            if not valid_grade_z(z):
                 continue
             score = d
             # Prefer major contour direct holds only when distances tie.
@@ -4342,8 +4186,8 @@ def rebuild_bc_profile_from_contours_v850(points: List[GenPoint], elev_segments:
         if any(a[2] == i for a in anchors):
             continue
 
-        before = [a for a in anchors if a[0] < st]
-        after = [a for a in anchors if a[0] > st]
+        before = [a for a in anchors if a[0] < st and same_curb_run((gp.easting,gp.northing),(a[3].easting,a[3].northing))]
+        after = [a for a in anchors if a[0] > st and same_curb_run((gp.easting,gp.northing),(a[3].easting,a[3].northing))]
         if not before or not after:
             continue
         lo = before[-1]
@@ -4380,7 +4224,7 @@ def is_direct_pdf_or_manual_hold_v851(gp: GenPoint) -> bool:
         "BC HP", "BC LP", "HP_TC", "LP_TC", "HIGH POINT", "LOW POINT",
         "HP/LP CALLOUT", "HP_HARD_HOLD", "LP_HARD_HOLD",
         "MANUAL", "PDF_TICK", "PDF LEADER", "PDF_SPOT", "PDF SPOT",
-        "HELD EXACT", "CALLOUT HELD", "TICK", "ARROW ENDPOINT", "LEADER ENDPOINT",
+        "HELD EXACT", "CALLOUT HELD", "HELD_CONTROL", "HELD CONTROL", "LANDXML", "TICK", "ARROW ENDPOINT", "LEADER ENDPOINT",
     ]
     return any(tok in txt for tok in hard)
 
@@ -4507,150 +4351,22 @@ def apply_contour_surface_mode_v851(points: List[GenPoint], contour_tin: Optiona
 
 
 def sanitize_field_elevations(points: List[GenPoint], unknown_to_zero: bool = False, max_local_jump: float = 8.0) -> int:
-    """Withhold unsafe or unknown elevations before field CSV export.
-
-    v8.3 field-safety rule:
-    GradeGuard must not export a believable elevation unless the source is strong enough
-    for field staking. Unknown or less-than-high-confidence points are withheld
-    from the stake-ready CSV so they cannot be mistaken for real 0.000 elevations.
-
-    Accepted as high-confidence:
-    - held/manual CAD/PDF callouts at the leader/arrow point,
-    - exact selected BC contour crossing,
-    - exact selected FL/gutter contour crossing plus verified curb height,
-    - LandXML/design surface,
-    - clean interpolation/proration between contour controls after converting FL/gutter controls to BC-equivalent elevations.
-
-    Withheld for review:
-    - no source,
-    - obvious project outlier,
-    - nearby contour fallback,
-    - one-sided control,
-    - mixed BC and FL/gutter interpolation,
-    - any source text containing REVIEW/LOW/UNKNOWN/UNSAFE.
-    """
-    if not points:
-        return 0
-    vals = [float(p.elevation) for p in points if p.elevation is not None and abs(float(p.elevation)) > 1e-9]
-    if not vals:
-        for p in points:
-            p.elevation = 0.0 if unknown_to_zero else None
-            p.confidence = (p.confidence + "; WITHHELD_UNKNOWN").strip("; ") if p.confidence else "WITHHELD_UNKNOWN"
-            p.issue = (p.issue + " " if p.issue else "") + "No reliable elevation source found. Point withheld from stake-ready export."
-        return len(points)
-
-    vals_sorted = sorted(vals)
-    med = vals_sorted[len(vals_sorted)//2]
-    hard_outlier = max(50.0, max_local_jump * 5.0)
+    """One export decision for all tools. Keep rejected values only in review data."""
     withheld = 0
-
-    def strong_enough(gp: GenPoint) -> Tuple[bool, str]:
-        conf = (gp.confidence or "").upper()
-        src = (gp.source or "").upper()
-        issue = (gp.issue or "").upper()
-        text = " ".join([conf, src, issue])
-
-        # v8.4.1: accept real survey controls/interpolations BEFORE looking for
-        # generic REVIEW text.  Previous builds zeroed good interpolated values only
-        # because the explanatory issue said "review against the certified PDF."
-        high_confidence_tokens = [
-            "BC_CONTOUR_EXACT",
-            "BC_DIRECT_CONTOUR_HOLD_V850",
-            "BC_CONTOUR_PROFILE_PRORATE_V850",
-            "BC_NEAR_POINT_CONTOUR_DIRECT",
-            "BC_ENDPOINT_EXTENSION_CONTOUR_DIRECT",
-            "FL_CONTOUR_PLUS_CURB_EXACT",
-            "BC_CHAIN_CONTOUR_INTERP",
-            "SURVEY INTERPOLATION",
-            "LOCAL_CONTOUR_HOLD",
-            "LOCAL_CONTOUR_PRORATE",
-            "TIN_CONTOUR",
-            "CONTOUR_TIN",
-            "SURFACE_MODE_TIN_PLUS_CURB_V853",
-            "SURFACE_MODE_FL_EP_PLUS_CURB_V853",
-            "SURFACE_MODE_DIRECT_BC_CONTOUR_V853",
-            "SURFACE_MODE_TIN_DIRECT_V853",
-            "BC_POST_CHAIN_INTERP",
-            "BC_POST_NEAR_HOLD",
-            "HP_TC",
-            "LP_TC",
-            "HIGH POINT",
-            "LOW POINT",
-            "HP/LP CALLOUT",
-            "PROJECTED TO SELECTED BC AS HP/LP CALLOUT HOLD",
-            "HP_HARD_HOLD",
-            "LP_HARD_HOLD",
-            "HP/LP HARD HOLD",
-            "HP_LP_CLUSTER_HOLD_V857",
-        ]
-        if any(tok in text for tok in high_confidence_tokens) and "ZEROED" not in text and "UNSAFE" not in text:
-            # v8.4.2: HP/LP are true design break points. Do not reject an LP just
-            # because the words LOW POINT appear in the issue/source text.
-            return True, ""
-
-        # Explicit unsafe wording still loses.  Do not use plain "LOW " here,
-        # because that incorrectly catches LOW POINT / LP callouts.
-        if any(tok in text for tok in ["ZEROED", "UNKNOWN", "UNSAFE", "LOW_CONF", "LOW-CONFIDENCE", "LOW_BC_TOUCH", "ONE-SIDED", "NEARBY CONTOUR FALLBACK", "SURFACE_PLUS_CURB"]):
-            return False, "Source is fallback/low-confidence/nearby contour, not a 90% field stake source."
-        if "REVIEW" in text and not any(tok in conf for tok in ["BC_CONTOUR_EXACT", "FL_CONTOUR_PLUS_CURB_EXACT", "SURFACE_MODE_TIN_PLUS_CURB_V853", "SURFACE_MODE_FL_EP_PLUS_CURB_V853", "SURFACE_MODE_DIRECT_BC_CONTOUR_V853", "SURFACE_MODE_TIN_DIRECT_V853"]):
-            return False, "Source is marked REVIEW, so it was not exported as a field elevation."
-
-        exact_ok = [
-            "MANUAL", "HELD", "CAD SPOT", "PDF", "TC", "HP", "LP",
-            "BC_CONTOUR_EXACT", "FL_CONTOUR_PLUS_CURB_EXACT", "LANDXML", "SURFACE"
-        ]
-        if any(tok in text for tok in exact_ok):
-            return True, ""
-
-        if "BC_CHAIN_CONTOUR_INTERP" in conf or "SURVEY INTERPOLATION" in src:
-            return True, ""
-
-        if "LOCAL_CONTOUR_HOLD" in conf or "LOCAL_CONTOUR_PRORATE" in conf:
-            return True, ""
-
-        if "TIN_CONTOUR" in conf or "CONTOUR_TIN" in conf:
-            # v8.3: Allow prorated temporary TIN values from 3D contours when no stronger
-            # source exists, as long as no review/unsafe wording is present and the value
-            # passes the project outlier check below. This is equivalent to interpolating
-            # between contours instead of snapping to the nearest contour.
-            return True, ""
-
-        if "BC_TOUCH_INTERP" in conf and "FLOWLINE" not in src and "GUTTER" not in src:
-            return True, ""
-
-        return False, "Source was not strong enough for the 90% field-staking rule."
-
-    for gp in points:
-        reason = ""
-        if gp.elevation is None:
-            reason = "No reliable elevation source found."
-        else:
-            z = float(gp.elevation)
-            if abs(z) < 1e-9:
-                reason = "Elevation was already zero or missing."
-            elif abs(z - med) > hard_outlier:
-                reason = f"Elevation {z:.3f} is an obvious outlier from the project median {med:.3f}."
-            else:
-                ok, why = strong_enough(gp)
-                if not ok:
-                    reason = why
-        if reason:
-            gp.elevation = 0.0 if unknown_to_zero else None
-            gp.confidence = (gp.confidence + "; WITHHELD_REVIEW").strip("; ") if gp.confidence else "WITHHELD_REVIEW"
-            gp.issue = (gp.issue + " " if gp.issue else "") + reason + " Point withheld from stake-ready export; review before staking."
+    for point in points:
+        approved, reason = field_approval(point)
+        point.approved = approved
+        if not approved:
+            if point.elevation is not None:
+                point.calculated_elevation = point.elevation
+            point.elevation = None
+            point.confidence = (point.confidence + '; WITHHELD_REVIEW').strip('; ')
+            point.issue = (point.issue + ' ' if point.issue else '') + reason + ' Point withheld from stake-ready export.'
             withheld += 1
     return withheld
 
 def stake_ready_points(points: List[GenPoint]) -> List[GenPoint]:
-    """Return points carrying a non-zero numeric elevation approved by the sanitizer."""
-    ready = []
-    for point in points:
-        try:
-            if point.elevation is not None and abs(float(point.elevation)) > 1e-9:
-                ready.append(point)
-        except (TypeError, ValueError):
-            continue
-    return ready
+    return [point for point in points if field_approval(point)[0]]
 
 
 def write_csv(points: List[GenPoint], out_path: str) -> int:
@@ -4664,7 +4380,8 @@ def write_csv(points: List[GenPoint], out_path: str) -> int:
         ready = stake_ready_points(points)
         for p in ready:
             elev = f"{float(p.elevation):.3f}"
-            w.writerow([p.point, f"{p.northing:.3f}", f"{p.easting:.3f}", elev, p.desc or "BC"])
+            description = (p.desc or "BC").replace('\r', ' ').replace('\n', ' ')
+            w.writerow([p.point, f"{p.northing:.3f}", f"{p.easting:.3f}", elev, description])
     return len(ready)
 
 
@@ -4683,10 +4400,10 @@ def write_do_not_stake_csv(points: List[GenPoint], out_path: str) -> int:
 def write_debug_csv(points: List[GenPoint], out_path: str):
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["Point", "Northing", "Easting", "Elevation", "Description", "Source", "Confidence", "Issue"])
+        w.writerow(["Point", "Northing", "Easting", "Elevation", "Description", "Source", "Confidence", "Issue", "Calculated_Elevation_REVIEW_ONLY"])
         for p in points:
             elev = "" if p.elevation is None else f"{p.elevation:.3f}"
-            w.writerow([p.point, f"{p.northing:.3f}", f"{p.easting:.3f}", elev, p.desc or "BC", p.source, p.confidence, p.issue])
+            w.writerow([p.point, f"{p.northing:.3f}", f"{p.easting:.3f}", elev, p.desc or "BC", p.source, p.confidence, p.issue, p.calculated_elevation if p.calculated_elevation is not None else ""])
 
 
 
@@ -4695,51 +4412,12 @@ def write_debug_csv(points: List[GenPoint], out_path: str):
 # ----------------------------
 
 def gg_v9_status_for_point(p: GenPoint) -> Tuple[str, str]:
-    """Return GREEN/YELLOW/RED and a short reason.
-
-    This is office QA, not a separate crew report.
-    GREEN  = ready to stake based on strong source.
-    YELLOW = calculated but review recommended.
-    RED    = do not stake until reviewed/fixed.
-    """
-    txt = " ".join([(p.source or ""), (p.confidence or ""), (p.issue or ""), (p.desc or "")]).upper()
-
-    if p.elevation is None:
-        return "RED", "Missing elevation."
-    try:
-        z = float(p.elevation)
-    except Exception:
-        return "RED", "Elevation is not numeric."
-    if abs(z) < 1e-9:
-        return "RED", "0.000 elevation requires review."
-
-    red_terms = [
-        "ZEROED_REVIEW", "WITHHELD_REVIEW", "WITHHELD_UNKNOWN", "UNSUPPORTED", "MISSING", "NO RELIABLE", "DO NOT STAKE",
-        "FIELD ELEVATION SET TO 0.000", "NOT BRACKETED", "COULD NOT"
-    ]
-    if any(t in txt for t in red_terms):
-        return "RED", "Point has a blocking review/source warning."
-
-    strong_terms = [
-        "PDF_TICK", "PDF LEADER", "PDF_SPOT", "MANUAL", "TC/BC", "BC_CONTOUR",
-        "DIRECT BC", "CONTOUR ON SELECTED BC", "FL/GUTTER", "FLOWLINE/GUTTER/EP",
-        "PLUS CURB", "CURB HEIGHT", "HP_LP", "HP/LP", "SURFACE_PLUS_CURB",
-        "BC_TOUCH_INTERP", "STATION", "TIN", "LANDXML", "SURFACE"
-    ]
-
-    yellow_terms = [
-        "REVIEW", "LOW_CONTOUR", "SURFACE_REVIEW", "FALLBACK", "NEARBY",
-        "ENDPOINT", "CLUSTER HOLD", "FLAT", "NO-FLOW", "CHECK"
-    ]
-
-    if any(t in txt for t in yellow_terms):
-        # Strong source with review wording is still not red, but should be checked.
-        return "YELLOW", "Calculated from usable evidence, but flagged for office review."
-
-    if any(t in txt for t in strong_terms):
-        return "GREEN", "Trusted GradeGuard source."
-
-    return "YELLOW", "Calculated value, but source confidence is not explicit."
+    approved, reason = field_approval(p)
+    if not approved:
+        return 'RED', reason
+    if p.issue:
+        return 'YELLOW', 'Approved control/calculation with an office QA note: ' + p.issue
+    return 'GREEN', 'Approved source and finite coordinates/elevation.'
 
 
 def write_confidence_summary_csv(points: List[GenPoint], out_path: str) -> Dict[str, int]:
@@ -4763,11 +4441,14 @@ def write_surface_conflict_report_csv(points: List[GenPoint], out_path: str, max
     """
     rows = []
     good = [p for p in points if p.elevation is not None]
-    for a, b in zip(good[:-1], good[1:]):
+    for a, b, d in diagnostic_pairs(points):
+        if a.elevation is None or b.elevation is None:
+            continue
         pa = (float(a.easting), float(a.northing))
         pb = (float(b.easting), float(b.northing))
-        d = dist(pa, pb)
         if d < min_distance or d > max_distance:
+            continue
+        if CURB_SEGMENTS and not same_curb_run(pa,pb):
             continue
         dz = float(b.elevation) - float(a.elevation)
         desc = ((a.desc or "") + " " + (b.desc or "")).upper()
@@ -4799,16 +4480,16 @@ def write_surface_conflict_report_csv(points: List[GenPoint], out_path: str, max
 def write_v9_package_manifest(out_dir: str, csv_path: str, debug_csv_path: str, report_path: str, confidence_path: str, conflict_path: str, flow_pdf_path: str, dxf_stats: Dict[str, Any], do_not_stake_path: str = "") -> str:
     manifest_path = os.path.join(out_dir, "GradeGuard_v9_Survey_Package_Manifest.txt")
     with open(manifest_path, "w", encoding="utf-8") as f:
-        f.write("Schoel GradeGuard v9.0 Survey Package Mode\n")
+        f.write(f"Schoel GradeGuard v{APP_VERSION} Survey Package Mode\n")
         f.write("=========================================\n\n")
         f.write("Core staking rules locked in this build:\n")
-        f.write("1. Final signed PDF controls.\n")
+        f.write("1. User-reviewed PDF controls govern; the software does not certify plan signatures or local curb detail applicability.\n")
         f.write("2. CAD/DXF gives geometry.\n")
-        f.write("3. Proposed contours build the grading surface.\n")
+        f.write("3. Selected LandXML faces and connected contour brackets supply approved grades; temporary contour TIN is review-only.\n")
         f.write("4. Actual contour on selected BC holds exact elevation.\n")
         f.write("5. Actual contour on selected EP/FL/gutter adds standard/PDF curb height.\n")
         f.write("6. Normal BC points between controls prorate by station along the connected curb run.\n")
-        f.write("7. HP and LP always hold and are never averaged through.\n")
+        f.write("7. Explicitly located HP/LP controls hold; ambiguous or unregistered callouts require review.\n")
         f.write("8. Bad jumps, surface conflicts, drainage flat spots, and unsupported elevations are flagged for office QA.\n")
         f.write("9. No separate crew-view report is created.\n\n")
         f.write("Outputs:\n")
@@ -4902,10 +4583,13 @@ def write_water_flow_pdf(points: List[GenPoint], out_path: str, spacing: float =
     max_gap = max(float(spacing or 25.0) * 1.75, 45.0)
     arrow_count = 0
     flat_count = 0
-    for a, b in zip(good[:-1], good[1:]):
+    for a, b, d in diagnostic_pairs(points):
+        if a.elevation is None or b.elevation is None:
+            continue
         pa = (a.easting, a.northing); pb = (b.easting, b.northing)
-        d = dist(pa, pb)
         if d < 0.25 or d > max_gap:
+            continue
+        if CURB_SEGMENTS and not same_curb_run(pa,pb):
             continue
         dz = float(b.elevation) - float(a.elevation)
         slope = abs(dz) / d if d > 0 else 0
@@ -5045,91 +4729,50 @@ def similarity_transform_from_two_points(p1, p2, q1, q2):
 
 
 def affine_transform_from_points(alignment_points):
-    """Build a PDF-to-CAD transform without ever scaling the DXF.
-
-    v1.7 rule:
-    - CAD/DXF coordinates stay fixed in real State Plane feet.
-    - The PDF is what gets scaled, rotated, and shifted to CAD.
-    - Use a best-fit SIMILARITY transform, not a free affine/shear transform.
-      That keeps the PDF like a real sheet of paper and prevents it from being
-      warped just to fit imperfect text boxes.
-    - The routine tests both normal and reflected PDF-Y direction because PDF Y
-      increases downward while CAD Northing increases upward.
-    """
-    pts = alignment_points or []
+    """Fit similarity/reflected-similarity models without altering CAD coordinates."""
+    import numpy as np
     clean = []
-    for p in pts:
+    for point in alignment_points or []:
         try:
-            x, y = float(p["pdf"][0]), float(p["pdf"][1])
-            e, n = float(p["cad"][0]), float(p["cad"][1])
-            clean.append((x, y, e, n))
-        except Exception:
-            pass
-    if len(clean) < 2:
-        return None, {"points": len(clean), "method": "none", "warning": "Need at least two alignment points or Auto Overlay."}
-    try:
-        import numpy as np
-        X = np.array([[x, y] for x, y, e, n in clean], dtype=float)
-        Y = np.array([[e, n] for x, y, e, n in clean], dtype=float)
-
-        def solve_model(reflect=False):
-            # Model with no shear.
-            # Non-reflect: E = a*x - b*y + tx ; N = b*x + a*y + ty
-            # Reflect:     E = a*x + b*y + tx ; N = b*x - a*y + ty
-            rows = []
-            vals = []
-            for (x, y), (e, n) in zip(X, Y):
-                if reflect:
-                    rows.append([x, y, 1, 0]); vals.append(e)
-                    rows.append([y, -x, 0, 1]); vals.append(n)  # n = b*x - a*y + ty -> [y,-x] on [b,a]? handled below by coeff map
-                else:
-                    rows.append([x, -y, 1, 0]); vals.append(e)
-                    rows.append([y, x, 0, 1]); vals.append(n)
-            A = np.array(rows, dtype=float)
-            B = np.array(vals, dtype=float)
-            sol = np.linalg.lstsq(A, B, rcond=None)[0]
-            if reflect:
-                # rows used unknowns [a,b,tx,ty] for E; N row [b,-a,0,1]
-                a, b, tx, ty = sol
-                ce = [float(a), float(b), float(tx)]
-                cn = [float(b), float(-a), float(ty)]
-            else:
-                a, b, tx, ty = sol
-                ce = [float(a), float(-b), float(tx)]
-                cn = [float(b), float(a), float(ty)]
-            errs = []
-            for x, y, e, n in clean:
-                pe = ce[0]*x + ce[1]*y + ce[2]
-                pn = cn[0]*x + cn[1]*y + cn[2]
-                errs.append(((pe-e)**2 + (pn-n)**2)**0.5)
-            rmse = (sum(v*v for v in errs)/len(errs))**0.5 if errs else 0.0
-            scale = (ce[0]**2 + ce[1]**2)**0.5
-            return (ce, cn, rmse, scale, reflect)
-
-        cand = [solve_model(False), solve_model(True)]
-        ce, cn, rmse, scale, reflect = min(cand, key=lambda z: z[2])
-        warn = ""
-        if rmse > 2.0:
-            warn = "Auto overlay RMSE is over 2 ft. The PDF is scaled/rotated, but click-held TC tick anchors should still be reviewed."
-        return (ce, cn), {"points": len(clean), "method": "PDF similarity transform, scale/rotate/shift only, DXF fixed", "rmse_ft": rmse, "pdf_scale_ft_per_point": scale, "reflected_pdf_y": reflect, "warning": warn}
-    except Exception:
-        # Fallback: exact two-point scale/rotate/shift.
-        p1, p2 = clean[0], clean[1]
-        x1,y1,e1,n1 = p1; x2,y2,e2,n2 = p2
-        dxp, dyp = x2-x1, y2-y1
-        dxc, dyc = e2-e1, n2-n1
-        lp = math.hypot(dxp, dyp)
-        lc = math.hypot(dxc, dyc)
-        if lp == 0:
-            return None, {"points": len(clean), "method": "fallback failed", "warning": "Alignment points are coincident."}
-        sc = lc / lp
-        ap = math.atan2(dyp, dxp)
-        ac = math.atan2(dyc, dxc)
-        th = ac - ap
-        a = sc * math.cos(th); b = sc * math.sin(th)
-        ce = [a, -b, e1 - (a*x1 - b*y1)]
-        cn = [b,  a, n1 - (b*x1 + a*y1)]
-        return (ce, cn), {"points": len(clean), "method": "two point PDF scale/rotate/shift, DXF fixed", "warning": "Numpy unavailable, using first two alignment points."}
+            values = (*map(float,point['pdf']), *map(float,point['cad']))
+            if len(values) != 4 or not all(math.isfinite(v) for v in values):
+                raise ValueError()
+            clean.append(values)
+        except (ValueError,KeyError,TypeError):
+            return None, {'warning':'Invalid/nonfinite alignment control.', 'points':len(clean)}
+    if len(clean) < 2 or len({v[:2] for v in clean}) < 2:
+        return None, {'warning':'Need distinct alignment controls.', 'points':len(clean)}
+    # Center before solving to avoid loss of significance in State Plane coordinates.
+    X = np.array([v[:2] for v in clean]); Y = np.array([v[2:] for v in clean])
+    xm = X.mean(axis=0); ym = Y.mean(axis=0)
+    centered = X-xm; target = Y-ym
+    candidates = []
+    for reflect in (False,True):
+        rows=[]; values=[]
+        for (x,y),(e,n) in zip(centered,target):
+            rows.extend([[x,y],[-y,x]] if reflect else [[x,-y],[y,x]])
+            values.extend([e,n])
+        sol,_res,rank,_singular = np.linalg.lstsq(np.array(rows),np.array(values),rcond=None)
+        if rank < 2:
+            continue
+        a,b=map(float,sol)
+        if math.hypot(a,b) <= 1e-12:
+            continue
+        ce=[a,b if reflect else -b,0.0]
+        cn=[b,-a if reflect else a,0.0]
+        ce[2]=float(ym[0]-ce[0]*xm[0]-ce[1]*xm[1])
+        cn[2]=float(ym[1]-cn[0]*xm[0]-cn[1]*xm[1])
+        errs=[dist(transform_pdf_to_cad((ce,cn),(x,y)),(e,n)) for x,y,e,n in clean]
+        rmse=math.sqrt(sum(v*v for v in errs)/len(errs))
+        candidates.append((rmse,(ce,cn),reflect,math.hypot(a,b)))
+    if not candidates:
+        return None, {'warning':'Alignment is degenerate.', 'points':len(clean)}
+    rmse,model,reflected,scale=min(candidates,key=lambda v:v[0])
+    warning = 'Alignment RMSE exceeds 1 foot; verify controls.' if rmse > 1 else ''
+    if np.linalg.matrix_rank(centered) < 2:
+        warning = 'Collinear/two-point alignment cannot establish reflection; add a third noncollinear control.'
+    return model, {'points':len(clean),'method':'Centered similarity transform','rmse_ft':rmse,
+                   'pdf_scale_ft_per_point':scale,'reflected_pdf_y':reflected,'warning':warning}
 
 
 def transform_pdf_to_cad(model, pdf_xy):
@@ -5140,16 +4783,23 @@ def transform_pdf_to_cad(model, pdf_xy):
     return (float(ce[0]*x + ce[1]*y + ce[2]), float(cn[0]*x + cn[1]*y + cn[2]))
 
 
-def load_manual_anchor_file(path: str) -> Tuple[List[GradeLabel], Dict[str, Any]]:
+def load_manual_anchor_file(path: str, cad_path: str = '', pdf_path: str = '') -> Tuple[List[GradeLabel], Dict[str, Any]]:
     info = {"manual_anchor_file": path or "", "alignment_points": 0, "manual_spot_anchors": 0, "alignment": {}}
     labels: List[GradeLabel] = []
     if not path or not os.path.exists(path):
         return labels, info
     try:
-        data = json.loads(open(path, "r", encoding="utf-8").read())
+        with open(path, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
     except Exception as e:
-        info["warning"] = f"Could not read manual anchor file: {e}"
-        return labels, info
+        raise ValueError(f"Could not read manual anchor file: {e}") from e
+    validate_saved_drawing(data, cad_path)
+    if data.get('schema') and data.get('schema') != 'gradeguard.pdf-controls.v1':
+        raise ValueError('Unsupported PDF control schema. Review and save the controls again.')
+    reviewed_pdf = data.get('schema') == 'gradeguard.pdf-controls.v1'
+    if reviewed_pdf:
+        from gradeguard_pdf import validate_reviewed_data
+        validate_reviewed_data(data, pdf_path, cad_path)
     align_pts = data.get("alignment_points", []) or []
     spot_pts = data.get("manual_spots", []) or []
     info["alignment_points"] = len(align_pts)
@@ -5161,30 +4811,59 @@ def load_manual_anchor_file(path: str) -> Tuple[List[GradeLabel], Dict[str, Any]
             kind = str(s.get("kind", "TC")).upper().replace(" ", "_")
             elev = float(s.get("elev"))
             # Multi-job support: do not reject valid project elevations outside one job's range.
-            if not (-10000.0 <= elev <= 100000.0):
+            if not valid_grade_z(elev):
                 continue
             if "cad" in s:
                 e, n = float(s["cad"][0]), float(s["cad"][1])
             elif "pdf" in s and model is not None:
+                if minfo.get('warning'):
+                    raise ValueError("Manual PDF anchor alignment requires review: " + minfo['warning'])
                 e, n = transform_pdf_to_cad(model, tuple(s["pdf"]))
             else:
                 continue
             raw = s.get("raw") or f"Manual {kind} {elev:.3f}"
             page = s.get("page", "")
-            labels.append(GradeLabel(e, n, kind, elev, raw, f"MANUAL PDF C-5.0 tick anchor page {page}"))
-        except Exception:
-            continue
+            if not (math.isfinite(e) and math.isfinite(n)):
+                raise ValueError('CAD coordinates must be finite.')
+            source = f"MANUAL PDF tick anchor page {page}"
+            if reviewed_pdf:
+                source = (f"MANUAL REVIEWED PDF page {page}; {s['meaning']}; printed {s['raw_elevation']}; "
+                          f"local rise {s['curb_rise']}; {s['role']}; {s['reference']}")
+            labels.append(GradeLabel(e, n, kind, elev, raw, source))
+        except Exception as ex:
+            raise ValueError(f"Invalid manual tick anchor: {ex}") from ex
     return labels, info
 
 
-def save_manual_anchor_file(path: str, data: Dict[str, Any]):
+def validate_reviewed_controls_on_curb(labels, segments):
+    """The keyed position is the actual BC tick; never pull a remote label to BC."""
+    for label in labels:
+        if not label.source.startswith('MANUAL REVIEWED PDF'):
+            continue
+        distance = min((closest_point_t_on_segment((label.x, label.y), seg.a, seg.b)[2]
+                        for seg in segments), default=float('inf'))
+        if distance > 0.35:
+            raise ValueError(f'Reviewed PDF control {label.raw!r} is {distance:.3f} ft from selected BC. '
+                             'Verify the actual CAD curb tick and select its curb geometry; no automatic relocation is allowed.')
+
+
+def save_manual_anchor_file(path: str, data: Dict[str, Any], cad_path: str = ''):
+    data = dict(data)
+    if cad_path:
+        data.update(cad_path=cad_path, dxf_sha256=drawing_fingerprint(cad_path))
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 
-def run_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, spacing: float, default_curb_height: float, curb_layer_keywords: str, elev_layer_keywords: str, label_radius: float, contour_radius: float, min_slope: float, add_curb_height_to_contours: bool=False, contour_check_tolerance: float=0.15, manual_anchor_path: str="", require_manual_pdf_spots: bool=True, surface_path: str="", surface_mode: str="bc", selected_curb_path: str="", selected_flowline_path: str="", create_offset: bool=False, offset_distance: float=3.0, offset_mode: str="away_from_flowline", offset_reverse: bool=False):
-    os.makedirs(out_dir, exist_ok=True)
+def run_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, spacing: float, default_curb_height: float, curb_layer_keywords: str, elev_layer_keywords: str, label_radius: float, contour_radius: float, min_slope: float, add_curb_height_to_contours: bool=False, contour_check_tolerance: float=0.15, manual_anchor_path: str="", require_manual_pdf_spots: bool=True, surface_path: str="", surface_mode: str="bc", selected_curb_path: str="", selected_flowline_path: str="", create_offset: bool=False, offset_distance: float=3.0, offset_mode: str="away_from_flowline", offset_reverse: bool=False, source_policy: str="surface", surface_name: str="", units_confirmed: bool=False):
+    reset_generation_state()
+    validate_generation_inputs(cad_path, spacing, units_confirmed)
+    validate_numeric_settings(curb_height=default_curb_height, label_radius=label_radius, contour_radius=contour_radius,
+                              minimum_slope=min_slope, contour_tolerance=contour_check_tolerance, offset_distance=offset_distance)
+    if source_policy not in ('surface', 'contours', 'dxf_surface') or surface_mode not in ('auto', 'bc', 'flowline'):
+        raise ValueError('Choose a supported elevation source and surface interpretation.')
+    out_dir = prepare_output_directory(out_dir)
     ext = os.path.splitext(cad_path)[1].lower()
     if ext == ".dwg":
         raise RuntimeError("DWG files need to be converted to DXF first. Export from Civil 3D or use ODA File Converter, then load the DXF.")
@@ -5195,8 +4874,8 @@ def run_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, sp
     elev_keywords = [x.strip() for x in re.split(r"[,;]", elev_layer_keywords) if x.strip()]
     if not pdf_path or not os.path.exists(pdf_path) or not str(pdf_path).lower().endswith(".pdf"):
         raise RuntimeError("Civil PDF plan set is required. GradeGuard will not calculate BC elevations without the certified PDF plans because PDF callouts/details hold over CAD/DXF.")
-    selected_handles = load_selected_curb_handles(selected_curb_path)
-    selected_fl_handles = load_selected_curb_handles(selected_flowline_path)
+    selected_handles = load_selected_curb_handles(selected_curb_path, cad_path)
+    selected_fl_handles = load_selected_curb_handles(selected_flowline_path, cad_path)
     global FLOWLINE_SEGMENTS, CONTOUR_POINT_OVERRIDES
     FLOWLINE_SEGMENTS = selected_handles_to_segments(cad_path, selected_fl_handles, "Selected Flowline/Gutter")
     CONTOUR_POINT_OVERRIDES = {}
@@ -5237,13 +4916,14 @@ def run_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, sp
     raw_points, contour_crossings_added, fl_crossings_added = add_contour_crossing_bc_points(raw_points, segments, tolerance=0.35)
     dxf_stats["contour_crossing_bc_points_added"] = contour_crossings_added
     dxf_stats["flowline_contour_crossing_bc_points_added"] = fl_crossings_added
-    landxml_surface = safe_load_landxml_surface(surface_path)
+    landxml_surface = safe_load_landxml_surface(surface_path, surface_name)
     dxf_stats["landxml_surface"] = {"path": surface_path if landxml_surface else "", "triangles": len(landxml_surface.triangles) if landxml_surface else 0, "feature_segments": len(getattr(landxml_surface, "segments", []) or []) if landxml_surface else 0}
     # For 2D curb projects with no LandXML, build a temporary TIN from 3D contours so
     # curb elevations can be prorated between contours instead of reading the nearest contour.
     contour_tin_surface = build_contour_tin_surface(segments)
     dxf_stats["temporary_contour_tin"] = {"created": bool(contour_tin_surface), "points": int(len(contour_tin_surface.points)) if contour_tin_surface is not None else 0}
-    manual_labels, manual_info = load_manual_anchor_file(manual_anchor_path)
+    manual_labels, manual_info = load_manual_anchor_file(manual_anchor_path, cad_path, pdf_path)
+    validate_reviewed_controls_on_curb(manual_labels, CURB_SEGMENTS)
     pdf_scan["manual_pdf_tick_anchors"] = manual_info
 
     pdf_labels = []
@@ -5261,7 +4941,9 @@ def run_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, sp
             except Exception:
                 pass
             pdf_auto_labels, pdf_spot_info_auto = extract_pdf_spot_labels(pdf_path, default_curb_height, cad_ref_pts)
-            pdf_scan["pdf_grade_labels_found"] = len(pdf_auto_labels)
+            pdf_scan["pdf_grade_labels_found"] = pdf_spot_info_auto.get("pdf_spot_labels", 0)
+            pdf_scan["pdf_grade_observations"] = pdf_spot_info_auto
+            pdf_spot_info = pdf_spot_info_auto
             hp_lp_candidates = [l for l in pdf_auto_labels if l.kind in ("HP", "LP", "HP_TC", "LP_TC")]
             ambiguous_boc_labels = [l for l in pdf_auto_labels if l.kind in ("HP_BOC_AMBIG", "LP_BOC_AMBIG")]
             bottom_curb_labels = [l for l in pdf_auto_labels if l.kind in ("HP_BOTTOM_CURB", "LP_BOTTOM_CURB")]
@@ -5273,9 +4955,9 @@ def run_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, sp
                 l for l in hp_lp_candidates
                 if pdf_hp_lp_hard_hold_is_trusted(l, alignment)
             ]
-            pdf_scan["pdf_hp_lp_labels_found"] = len(hp_lp_candidates)
+            pdf_scan["pdf_hp_lp_labels_found"] = pdf_spot_info_auto.get("hp_lp_observations", 0)
             pdf_scan["pdf_hp_lp_labels_accepted_for_hard_hold"] = len(pdf_hp_lp_labels)
-            pdf_scan["pdf_hp_lp_labels_review_only"] = len(hp_lp_candidates) - len(pdf_hp_lp_labels)
+            pdf_scan["pdf_hp_lp_labels_review_only"] = pdf_spot_info_auto.get("hp_lp_observations", 0)
             pdf_scan["pdf_boc_ambiguous_labels_review_only"] = len(ambiguous_boc_labels)
             pdf_scan["pdf_bottom_of_curb_labels_review_only"] = len(bottom_curb_labels)
             pdf_scan["pdf_boc_rule"] = (
@@ -5286,11 +4968,11 @@ def run_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, sp
                 "Explicit BOTTOM OF CURB values are detected but remain review-only. Verify the applicable curb detail/height and manually anchor the intended staking elevation."
             )
             pdf_scan["pdf_hp_lp_hard_hold_gate"] = (
-                "Automatic PDF HP/LP hard holds require a vector leader/tick endpoint and PDF-to-CAD alignment RMSE <= 1.0 ft with no alignment warning. "
-                "All other PDF HP/LP detections are review-only and require a manual tick anchor."
+                "All PDF detections are review-only. Read PDF grades requires a verified legend/detail, "
+                "CAD curb tick, units/reference and local conversion before saving a held control."
             )
             if not require_manual_pdf_spots:
-                pdf_labels = pdf_auto_labels
+                pdf_labels = [l for l in pdf_auto_labels if l.kind in ('TC','BC','FL','FG','HP','LP','HP_TC','LP_TC') and pdf_hp_lp_hard_hold_is_trusted(l, alignment)]
                 pdf_spot_info = pdf_spot_info_auto
         except Exception as _e:
             pdf_scan["pdf_grade_label_error"] = str(_e)
@@ -5315,19 +4997,18 @@ def run_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, sp
     dxf_stats["pdf_spot_labels"] = len(pdf_labels)
     dxf_stats["cad_grade_labels"] = len(cad_labels)
     dxf_stats["calculation_order"] = [
-        "Certified civil PDF plan set is required. PDF callouts/details govern over CAD/DXF.",
-        "Manual/CAD/PDF tick TC/BC/HP/LP controls hold first at the leader/arrow endpoint. v8.4.4 attempts automatic PDF-to-DXF matching and reads the PDF leader/arrow/tick endpoint instead of the text box center; if auto alignment is approximate, the point is still projected to selected BC and flagged in the source report.",
-        "LandXML/Civil 3D TIN surface is the preferred calculation source when supplied.",
-        "v8.5.1 Surface Mode: when no LandXML is supplied, GradeGuard builds a temporary proposed grading surface from 3D DXF contours and samples normal BC points from that surface. Contours are interpolated as a surface first; station interpolation is QA/fallback.",
-        "DXF Topo-P-Surface / 3D feature lines are the next source.",
-        "DXF contour/surface evidence is first safety-filtered: zero-Z placeholders, far-away segments, and outlier elevations are removed before staking calculations.",
-        "Contours touching the BC layer are secondary; nearby contours are low confidence fallback.",
-        "If user selects a flowline/gutter line, contour hits there are raised by curb height to calculate BC.",
-        "If a contour touches selected BC, it holds exact contour elevation. If it touches selected FL/gutter/EP, GradeGuard adds the verified curb height from the PDF detail to make a BC-equivalent control. Points between clean controls are prorated/interpolated along the selected BC chain. Standard curb uses +0.50. Catch curb, spill curb, header curb, ramps, and transitions are flagged so the user can verify the correct height and direction from the certified PDF detail.",
-        "v8.4.7 measures from each generated BC point along the selected curb station to the contour control station. Short-gap contours projected to BC are direct BC controls and do not receive curb height.",
-        "v8.4.8 hard-locks true HP/LP callouts. HP/LP elevations hold exactly at the leader/tick/projected BC point and are never averaged, interpolated through, or overwritten by contour profile corrections."
+        "User-reviewed PDF tick controls hold first; automatic text-center/extents alignment is review-only.",
+        "Exact selected BC crossings hold directly; selected FL crossings add the entered curb height.",
+        "Preferred LandXML surface is sampled inside its selected faces, using explicit BC/FL meaning.",
+        "Connected BC/FL contour brackets supply station interpolation; disconnected runs do not share anchors.",
+        "Unconstrained contour TIN, unbracketed contours, ambiguous BOC and outside-surface estimates require review.",
+        "Held grades are protected. One shared export gate withholds unresolved points from every field CSV."
     ]
-    elevs = assign_elevations(raw_points, primary_labels, segments, verified_height, label_radius, contour_radius, False, contour_check_tolerance, landxml_surface=landxml_surface, surface_mode=surface_mode, contour_tin=contour_tin_surface)
+    dxf_stats["source_policy"] = source_policy
+    dxf_stats["surface_name"] = surface_name
+    dxf_stats["coordinate_units"] = "US survey feet; no coordinate/datum transformation"
+    dxf_stats["input_dxf_sha256"] = drawing_fingerprint(cad_path)
+    elevs = assign_elevations(raw_points, primary_labels, segments, verified_height, label_radius, contour_radius, False, contour_check_tolerance, landxml_surface=landxml_surface, surface_mode=surface_mode, contour_tin=contour_tin_surface, source_policy=source_policy)
 
     gen: List[GenPoint] = []
     pt = int(start_pt)
@@ -5335,39 +5016,14 @@ def run_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, sp
         gen.append(GenPoint(point=pt, northing=y, easting=x, elevation=elev, source=src, issue=issue, confidence=conf))
         pt += 1
     apply_pc_pt_descriptions(gen, base_desc='BC')
-    hp_lp_hard_locked = hard_lock_hp_lp_callout_elevations(gen, primary_labels, tolerance=2.50)
-    dxf_stats["v8_4_8_hp_lp_hard_locked"] = hp_lp_hard_locked
-    surface_mode_v851 = apply_contour_surface_mode_v851(gen, contour_tin_surface, segments, direct_tol=0.85, max_replace_diff=0.12, default_curb_height=verified_height, surface_mode=surface_mode)
-    dxf_stats["v8_5_1_surface_mode_corrected"] = surface_mode_v851
-    dxf_stats["v8_5_1_surface_mode_rule"] = "GradeGuard builds a temporary proposed grading surface from 3D DXF contours, samples normal BC points from that surface, then protects PDF/manual TC/BC/HP/LP callouts, storm low-point drainage intent, and direct contour hits. BC station interpolation is QA/fallback, not the primary surface." 
-    dxf_stats["v8_5_3_surface_component_rule"] = "Surface Mode is component-aware. A contour/TIN on picked BC holds directly. A contour/TIN that controls picked FL/gutter/EP is raised by the standard/PDF curb height to stake BC. Direct BC contours still do not get curb height."
-    dxf_stats["v8_5_4_curb_component_rule"] = "Locked survey rule: actual contour on selected BC holds exact elevation; actual contour on selected EP/FL/gutter is converted to BC by adding standard/PDF curb height; every other normal BC point is prorated by station between those BC-equivalent contour controls. Surface/TIN cannot overwrite these stronger curb-component controls."
+    for point in gen:
+        point.locked = held_result(point.confidence, point.source)
+    dxf_stats["hp_lp_hard_locked"] = hard_lock_hp_lp_callout_elevations(gen, primary_labels, tolerance=0.35)
     add_flow_warnings(gen, min_slope=min_slope)
-    tag_high_low_points(gen, max_gap=max(spacing * 2.25, 55.0), min_change=0.02)
+    tag_high_low_points(gen, max_gap=max(spacing*2.25,55.0), min_change=0.02)
     normalize_high_low_descriptions(gen)
-    station_profile_corrected = apply_bc_station_contour_profile_to_normal_points(gen, segments, contour_radius, verified_height)
-    dxf_stats["v8_4_7_station_distance_contour_profile_corrected"] = station_profile_corrected
-    direct_contour_holds_v850 = force_nearby_contour_direct_holds_v850(gen, segments, direct_tol=0.35, review_tol=1.25)
-    dxf_stats["v8_5_0_direct_contour_holds"] = direct_contour_holds_v850
-    profile_prorated_v850 = rebuild_bc_profile_from_contours_v850(gen, segments, max_gap=max(spacing * 3.25, 90.0))
-    dxf_stats["v8_5_0_contour_profile_prorated"] = profile_prorated_v850
-    surface_mode_v851_final = apply_contour_surface_mode_v851(gen, contour_tin_surface, segments, direct_tol=0.85, max_replace_diff=0.12, default_curb_height=verified_height, surface_mode=surface_mode)
-    dxf_stats["v8_5_1_surface_mode_final_corrected"] = surface_mode_v851_final
-    post_interp_filled = fill_missing_bc_elevations_by_station_interpolation(gen)
-    dxf_stats["v8_4_1_post_station_interpolation_filled"] = post_interp_filled
-    # Re-run flow/high-low tagging after the final v8.5 contour profile corrections.
-    add_flow_warnings(gen, min_slope=min_slope)
-    tag_high_low_points(gen, max_gap=max(spacing * 2.25, 55.0), min_change=0.02)
-    normalize_high_low_descriptions(gen)
-    hp_lp_cluster_holds_v857 = protect_close_hp_lp_clusters_v857(gen, cluster_tol=1.25, max_allowed_delta=0.20)
-    dxf_stats["v8_5_7_hp_lp_cluster_holds"] = hp_lp_cluster_holds_v857
-    dxf_stats["v8_4_8_hp_lp_hold_rule"] = "HP/LP plan callouts are hard vertical controls. Held HP/LP elevations are hard-locked to the callout value and are never averaged, interpolated through, overwritten by station contour profile correction, or withheld by the sanitizer. HP/LP points with no trusted callout elevation are withheld and flagged for review."
-    dxf_stats["v8_4_2_hp_lp_hold_rule"] = "HP/LP plan callouts are hard controls. Existing HP/LP elevations are never averaged; zero HP/LP points remain review items instead of being smoothed through."
-    withheld_review_count = sanitize_field_elevations(gen, unknown_to_zero=False)
-    dxf_stats["field_points_withheld_for_review"] = withheld_review_count
-    hp_lp_relocked_after_sanitize = hard_lock_hp_lp_callout_elevations(gen, primary_labels, tolerance=2.50)
-    dxf_stats["v8_4_8_hp_lp_relocked_after_sanitize"] = hp_lp_relocked_after_sanitize
-    normalize_high_low_descriptions(gen)
+    dxf_stats["field_points_withheld_for_review"] = sanitize_field_elevations(gen)
+    dxf_stats["calculation_policy"] = "9.3.1 single assignment; typed confidence and shared export approval; no automatic contour smoothing or grade replacement."
 
     csv_path = os.path.join(out_dir, "Generated_BC_Points.csv")
     debug_csv_path = os.path.join(out_dir, "Generated_BC_Points_with_sources.csv")
@@ -5415,6 +5071,11 @@ def run_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, sp
     manifest_path = write_v9_package_manifest(out_dir, csv_path, debug_csv_path, report_path, confidence_path, conflict_path, created_flow_pdf or "", dxf_stats, do_not_stake_path)
     dxf_stats["v9_0_package_manifest"] = manifest_path
     write_report(gen, layers, pdf_scan, dxf_stats, report_path)
+    from gradeguard_review import write_cad_review
+    write_cad_review(gen, out_dir, 'CURB', CURB_SEGMENTS, cad_path, pdf_path, surface_path,
+                     landxml_surface, anchor_path=manual_anchor_path,
+                     settings={'curb_rise': default_curb_height, 'surface_interpretation': surface_mode},
+                     extra_points=offset_pts if create_offset else [])
     return csv_path, debug_csv_path, report_path, len(gen), len([p for p in gen if p.issue]), stake_ready_count
 
 
@@ -5619,7 +5280,18 @@ def load_dxf_structures_and_text(cad_path: str, find_mode: str = "Both") -> Tupl
                 w=max(xs)-min(xs); h=max(ys)-min(ys)
                 # Limit to likely structures, not long pipe/curb lines.
                 if 1.0 <= w <= 25.0 and 1.0 <= h <= 25.0:
-                    add_struct(sum(xs)/len(xs), sum(ys)/len(ys), "", "DXF closed structure/polyline center", layer, handle)
+                    closed = bool(getattr(ent, 'closed', False) if typ == 'LWPOLYLINE' else ent.is_closed)
+                    if not closed:
+                        continue
+                    polygon = pts[:-1] if dist(pts[0], pts[-1]) < 1e-8 else pts
+                    pairs = list(zip(polygon, polygon[1:] + polygon[:1]))
+                    cross = [a[0]*b[1]-b[0]*a[1] for a,b in pairs]
+                    area2 = sum(cross)
+                    if abs(area2) <= 1e-12:
+                        continue
+                    cx = sum((a[0]+b[0])*c for (a,b),c in zip(pairs,cross))/(3*area2)
+                    cy = sum((a[1]+b[1])*c for (a,b),c in zip(pairs,cross))/(3*area2)
+                    add_struct(cx, cy, "", "DXF closed structure centroid", layer, handle)
     # Remove duplicate/false nearby structure centers and keep the best source.
     structures = dedupe_structure_candidates(structures, tol=2.0)
 
@@ -5649,8 +5321,9 @@ def extract_pdf_flout_text(pdf_path: str) -> Dict[str, List[Dict[str, Any]]]:
         text = page.get_text("text") or ""
         # Break into windows around structure labels.
         labels = [(m.start(), normalize_structure_label(m.group(0))) for m in STRUCTURE_RE.finditer(text)]
-        for idx, label in labels:
-            win = text[max(0, idx-350): idx+700].replace("\n", " ")
+        for number, (idx, label) in enumerate(labels):
+            end = labels[number+1][0] if number+1 < len(labels) else min(len(text),idx+700)
+            win = text[idx:end].replace("\n", " ")
             outs, invs = parse_inverts(win)
             pipe = parse_pipe_size(win)
             if outs or invs or pipe:
@@ -5678,25 +5351,26 @@ def build_flout_description(label: str, pipe: str, fmt: str, review: bool=False)
         if label: return f'{label} FL-OUT'
     return 'FL-OUT'
 
-def load_manual_flout_points(path: str) -> List[Dict[str, Any]]:
-    try:
-        if path and os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data.get("points", []) if isinstance(data, dict) else []
-    except Exception:
-        pass
-    return []
+def load_manual_flout_points(path: str, cad_path: str = '') -> List[Dict[str, Any]]:
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, encoding='utf-8') as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict):
+        raise ValueError('Invalid manual FL OUT control file.')
+    validate_saved_drawing(data, cad_path)
+    return data.get('points', [])
 
 def save_manual_flout_points(path: str, points: List[Dict[str, Any]], cad_path: str):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"cad_path": cad_path, "points": points}, f, indent=2)
-    except Exception:
-        pass
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as stream:
+        json.dump({'cad_path': cad_path, 'dxf_sha256': drawing_fingerprint(cad_path), 'points': points}, stream, indent=2)
 
-def run_flout_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, find_mode: str, desc_format: str, search_radius: float, manual_path: str = "") -> Tuple[str, str, int, int, int]:
-    os.makedirs(out_dir, exist_ok=True)
+def run_flout_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: int, find_mode: str, desc_format: str, search_radius: float, manual_path: str = "", units_confirmed: bool = False) -> Tuple[str, str, int, int, int]:
+    validate_numeric_settings(search_radius=search_radius)
+    out_dir = prepare_output_directory(out_dir)
+    reset_generation_state()
+    validate_generation_inputs(cad_path, units_confirmed=units_confirmed)
     structures, texts = load_dxf_structures_and_text(cad_path, find_mode)
     pdf_by_label = extract_pdf_flout_text(pdf_path)
     points: List[GenPoint] = []
@@ -5717,6 +5391,8 @@ def run_flout_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: i
                 label=t["label"]
             if not pipe and t.get("pipe"):
                 pipe=t["pipe"]
+            if not label or not t.get("label") or normalize_structure_label(t["label"]) != normalize_structure_label(label):
+                continue
             if t.get("outs"):
                 outs.extend(t["outs"]); source_parts.append(f"CAD OUT text {t['raw'][:80]}")
             if t.get("inverts"):
@@ -5731,12 +5407,16 @@ def run_flout_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: i
                 if item.get("inverts"):
                     invs.extend(item["inverts"])
         elev=None; conf="REVIEW"; issue=""
-        if outs:
-            elev=min(outs); conf="HIGH"; issue=""
+        unique_outs = sorted({float(z) for z in outs if valid_grade_z(z)})
+        if len(unique_outs) == 1:
+            elev=unique_outs[0]; conf="STRUCTURE_OUT"; issue=""
             assigned += 1
+        elif len(unique_outs) > 1:
+            issue="Conflicting OUT elevations for this structure. Review required."
+            review += 1
         elif invs:
-            elev=min(invs); conf="MEDIUM"; issue="No explicit OUT found. Used lowest nearby invert/FL. Review in/out direction."
-            assigned += 1; review += 1
+            issue="No explicit OUT found. IN/unspecified inverts cannot define FL OUT."
+            review += 1
         else:
             issue="No FL OUT / invert elevation found nearby. Review plans."
             review += 1
@@ -5745,7 +5425,7 @@ def run_flout_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: i
         points.append(GenPoint(start_pt+i, st["y"], st["x"], elev, desc, src, issue, conf))
     # Add manually picked structure center / FL OUT records last. These are high confidence
     # because the user clicked the structure center and keyed the flowline out data.
-    manual = load_manual_flout_points(manual_path)
+    manual = load_manual_flout_points(manual_path, cad_path)
     for item in manual:
         try:
             x = float(item.get("x")); y = float(item.get("y"))
@@ -5765,13 +5445,16 @@ def run_flout_generation(cad_path: str, pdf_path: str, out_dir: str, start_pt: i
         else:
             review += 1
         pick_source = (item.get("pick_source") or "Manual picked structure center")
-        points.append(GenPoint(start_pt+len(points), y, x, elev, desc, f"{pick_source} / keyed FL OUT", issue, "HIGH" if elev is not None else "REVIEW"))
+        points.append(GenPoint(start_pt+len(points), y, x, elev, desc, f"{pick_source} / keyed FL OUT", issue, "MANUAL_FL_OUT" if elev is not None else "REVIEW"))
 
     csv_path=os.path.join(out_dir,"Generated_FL_OUT_Points.csv")
     debug_path=os.path.join(out_dir,"Generated_FL_OUT_QA_Report.csv")
+    sanitize_field_elevations(points)
     write_csv(points, csv_path)
+    write_do_not_stake_csv(points, os.path.join(out_dir, "FL_OUT_DO_NOT_STAKE.csv"))
     write_debug_csv(points, debug_path)
-    return csv_path, debug_path, len(points), assigned, review
+    assigned = len(stake_ready_points(points))
+    return csv_path, debug_path, len(points), assigned, len(points)-assigned
 
 
 
@@ -5888,58 +5571,37 @@ def detect_sidewalk_width_from_opposite_edge(dxf_path: str, selected_handles: Li
     return float(mid), f"Detected sidewalk width from opposite edge: {mid:.2f} ft using {len(hits)} perpendicular hits."
 
 
-def enforce_sidewalk_local_reasonableness(points: List[Point2], elevs: List[Tuple[Optional[float], str, str, str]], max_local_jump: float = 0.75, search_radius: float = 35.0) -> List[Tuple[Optional[float], str, str, str]]:
-    """Protect sidewalk staking from bad contour/TIN triangles.
-
-    Sidewalk grades should be interpolated locally.  If one point is several feet
-    different from nearby sidewalk points, it is almost always a bad contour/TIN
-    association from a distant contour or an open contour triangle.  This routine
-    does not create design data, but it prevents obvious bad outliers from being
-    exported as final field points.  It replaces only large local outliers and
-    writes a review note in the debug CSV.
-    """
-    if not points or len(points) != len(elevs):
-        return elevs
-    out=[list(e) for e in elevs]
-    zs=[e[0] for e in elevs]
-    for i,p in enumerate(points):
-        zi=out[i][0]
-        if zi is None:
+def enforce_sidewalk_local_reasonableness(points, elevs, max_local_jump=0.75, search_radius=35.0):
+    """Flag unsupported local discontinuities; never redesign a grade by median."""
+    out = [list(e) for e in elevs]
+    for i, p in enumerate(points):
+        z, src, issue, conf = out[i]
+        if z is None or held_result(conf, src) or 'SURFACE_HIGH' in conf:
             continue
-        neigh=[]
-        for j,q in enumerate(points):
-            if i==j or zs[j] is None:
-                continue
-            d=math.hypot(q[0]-p[0], q[1]-p[1])
-            if 0.1 < d <= search_radius:
-                neigh.append((d,float(zs[j])))
-        if len(neigh) < 4:
-            continue
-        neigh.sort(key=lambda x:x[0])
-        vals=[z for d,z in neigh[:10]]
-        vals.sort()
-        med=vals[len(vals)//2]
-        if abs(float(zi)-med) > max_local_jump:
-            old=float(zi)
-            out[i][0]=round(med,3)
-            out[i][1]=(out[i][1] or '') + f"; local sidewalk sanity adjusted {old:.3f} to nearby grade {med:.3f}"
-            out[i][2]=((out[i][2] + ' ') if out[i][2] else '') + f"Review: sidewalk elevation was a local outlier by {abs(old-med):.2f} ft. Likely bad distant contour/TIN hit; adjusted to nearby local sidewalk grade."
-            out[i][3]=out[i][3] or 'LOCAL_REVIEW'
+        neighbors = [float(elevs[j][0]) for j,q in enumerate(points) if i != j and elevs[j][0] is not None and 0.1 < dist(p,q) <= search_radius]
+        if len(neighbors) >= 4:
+            med = sorted(neighbors)[len(neighbors)//2]
+            if abs(z-med) > max_local_jump:
+                out[i][2] = (issue+'; ' if issue else '')+'LOCAL_REVIEW: discontinuity requires a design check; elevation preserved.'
+                out[i][3] = 'LOCAL_REVIEW'
     return [tuple(e) for e in out]
 
 
-def run_edge_sidewalk_generation(cad_path: str, pdf_path: str, surface_path: str, out_dir: str, start_pt: int, spacing: float, description: str, elev_layer_keywords: str, contour_radius: float, selected_sidewalk_path: str = "", cross_slope_percent: float = 0.0, sidewalk_width: float = 0.0, cross_slope_adjust: str = "direct", auto_detect_width: bool = True):
+def run_edge_sidewalk_generation(cad_path: str, pdf_path: str, surface_path: str, out_dir: str, start_pt: int, spacing: float, description: str, elev_layer_keywords: str, contour_radius: float, selected_sidewalk_path: str = "", cross_slope_percent: float = 0.0, sidewalk_width: float = 0.0, cross_slope_adjust: str = "direct", auto_detect_width: bool = True, surface_name: str = "", units_confirmed: bool = False):
     """Generate edge-of-sidewalk staking points from selected sidewalk edge geometry.
 
     This is intentionally separate from BC staking. It uses the same surface/contour
     elevation engine, but descriptions default to SIDEWALK and it does not apply curb height.
     """
-    os.makedirs(out_dir, exist_ok=True)
+    reset_generation_state()
+    validate_generation_inputs(cad_path, spacing, units_confirmed)
+    validate_numeric_settings(cross_slope_percent=cross_slope_percent, sidewalk_width=sidewalk_width, contour_radius=contour_radius)
+    out_dir = prepare_output_directory(out_dir)
     if not cad_path or not os.path.exists(cad_path):
         raise RuntimeError("Pick a Civil CAD DXF first.")
     if cad_path.lower().endswith(".dwg"):
         raise RuntimeError("DWG files need to be converted to DXF first.")
-    selected_handles = load_selected_curb_handles(selected_sidewalk_path)
+    selected_handles = load_selected_curb_handles(selected_sidewalk_path, cad_path)
     width_note = "Manual sidewalk width used."
     detected_width = None
     if auto_detect_width and selected_handles:
@@ -5954,7 +5616,7 @@ def run_edge_sidewalk_generation(cad_path: str, pdf_path: str, surface_path: str
     raw_points, pcpt_added = add_curb_geometry_control_points(raw_points, tolerance=0.05)
     raw_points, edge_contour_added = add_edge_contour_crossing_points(raw_points, segments, tolerance=0.25)
     raw_points, projected_edge_labels, edge_callouts_added = add_grade_callout_points_to_selected_edge(raw_points, cad_labels, tolerance=0.35, max_label_to_edge_dist=140.0)
-    landxml_surface = safe_load_landxml_surface(surface_path)
+    landxml_surface = safe_load_landxml_surface(surface_path, surface_name)
     pdf_scan = scan_pdf_for_curb_terms(pdf_path)
     # Projected CAD/PDF leader tick callouts hold first. When there is no LandXML surface,
     # build a TIN from the 3D contour polylines so sidewalk grades are prorated between
@@ -5987,7 +5649,9 @@ def run_edge_sidewalk_generation(cad_path: str, pdf_path: str, surface_path: str
     csv_path=os.path.join(out_dir, "Generated_Edge_Sidewalk_Points.csv")
     debug_path=os.path.join(out_dir, "Generated_Edge_Sidewalk_Points_with_sources.csv")
     report_path=os.path.join(out_dir, "GradeGuard_Edge_Sidewalk_Report.html")
+    sanitize_field_elevations(gen)
     write_csv(gen, csv_path)
+    write_do_not_stake_csv(gen, os.path.join(out_dir, "Sidewalk_DO_NOT_STAKE.csv"))
     write_debug_csv(gen, debug_path)
     sidewalk_flow_pdf = os.path.join(out_dir, "GradeGuard_Sidewalk_Water_Flow_Map.pdf")
     dxf_stats["sidewalk_water_flow_pdf"] = write_water_flow_pdf(gen, sidewalk_flow_pdf, spacing=spacing, min_slope=0.001, title="Schoel GradeGuard - Sidewalk Water Flow Map") or ""
@@ -5999,17 +5663,24 @@ def run_edge_sidewalk_generation(cad_path: str, pdf_path: str, surface_path: str
     dxf_stats["landxml_surface"] = {"path": surface_path if landxml_surface else "", "triangles": len(landxml_surface.triangles) if landxml_surface else 0, "feature_segments": len(getattr(landxml_surface, "segments", []) or []) if landxml_surface else 0}
     dxf_stats["sidewalk_cross_slope"] = {"percent": cross_slope_percent, "width_ft": sidewalk_width, "adjustment": cross_slope_adjust, "auto_detect_width": auto_detect_width, "detected_width_ft": detected_width, "width_note": width_note}
     write_report(gen, layers, pdf_scan, dxf_stats, report_path)
+    from gradeguard_review import write_cad_review
+    write_cad_review(gen, out_dir, 'SIDEWALK', CURB_SEGMENTS, cad_path, pdf_path, surface_path,
+                     landxml_surface, settings={'cross_slope_percent':cross_slope_percent,'width':sidewalk_width,'adjustment':cross_slope_adjust})
     return csv_path, debug_path, report_path, len(gen), len([p for p in gen if p.elevation is not None]), len([p for p in gen if p.elevation is None])
 
 
-def run_grade_grid_generation(cad_path: str, surface_path: str, out_dir: str, start_pt: int, grid_spacing: float, subtract_amount: float, description: str, elev_layer_keywords: str, contour_radius: float, selected_curb_path: str = ""):
+def run_grade_grid_generation(cad_path: str, surface_path: str, out_dir: str, start_pt: int, grid_spacing: float, subtract_amount: float, description: str, elev_layer_keywords: str, contour_radius: float, selected_curb_path: str = "", surface_name: str = "", units_confirmed: bool = False):
     """Generate a simple finished grade or subgrade grid across the selected curb/site extents.
 
     This is intentionally separate from BC staking.  CAD/DXF supplies the horizontal limits,
     while LandXML/Topo-P-Surface/contours supply finished grade.  For SUBGRADE, the user-entered
     amount is subtracted from finished grade.  For FINISHED GRADE, subtract should be 0.
     """
-    os.makedirs(out_dir, exist_ok=True)
+    reset_generation_state()
+    validate_generation_inputs(cad_path, grid_spacing, units_confirmed)
+    if not math.isfinite(float(subtract_amount)) or subtract_amount < 0:
+        raise ValueError("Subgrade deduction must be finite and nonnegative.")
+    out_dir = prepare_output_directory(out_dir)
     ext = os.path.splitext(cad_path)[1].lower()
     if ext == ".dwg":
         raise RuntimeError("DWG files need to be converted to DXF first. Export from Civil 3D or use ODA File Converter, then load the DXF.")
@@ -6020,7 +5691,7 @@ def run_grade_grid_generation(cad_path: str, surface_path: str, out_dir: str, st
 
     elev_keywords = [x.strip() for x in re.split(r"[,;]", elev_layer_keywords) if x.strip()]
     # Use the selected BC objects if present for the grid limits; otherwise use auto curb detection.
-    selected_handles = load_selected_curb_handles(selected_curb_path)
+    selected_handles = load_selected_curb_handles(selected_curb_path, cad_path)
     curb_keywords = ["AUTO", "SITE-P-BC", "SITE-BC", "P-BC", "BOC", "BACK OF CURB", "BACK-CURB", "BACK_CURB", "BC", "TBC", "TOP BACK OF CURB", "P-CURB", "CURB"]
     raw_points, layers, cad_labels, segments, dxf_stats = load_dxf_geometry_and_elevations(cad_path, curb_keywords, elev_keywords, max(25.0, grid_spacing), selected_handles)
 
@@ -6054,9 +5725,9 @@ def run_grade_grid_generation(cad_path: str, surface_path: str, out_dir: str, st
             x += grid_spacing
         y += grid_spacing
 
-    landxml_surface = safe_load_landxml_surface(surface_path)
+    landxml_surface = safe_load_landxml_surface(surface_path, surface_name)
     # For site grade grids, contours/surfaces represent finished grade directly.  Never apply curb height here.
-    elevs = assign_elevations(grid, [], segments, 0.0, 0.0, contour_radius, False, 0.15, landxml_surface=landxml_surface, surface_mode="bc")
+    elevs = assign_elevations(grid, [], segments, 0.0, 0.0, contour_radius, False, 0.15, landxml_surface=landxml_surface, surface_mode="bc", curb_controls=False)
 
     desc = (description or "SUBGRADE").upper().strip()
     pts=[]
@@ -6072,29 +5743,24 @@ def run_grade_grid_generation(cad_path: str, surface_path: str, out_dir: str, st
     safe = "SUBGRADE" if desc == "SUBGRADE" else "FINISHED_GRADE"
     csv_path = os.path.join(out_dir, f"Generated_{safe}_Points.csv")
     debug_path = os.path.join(out_dir, f"Generated_{safe}_Points_with_sources.csv")
+    sanitize_field_elevations(pts)
     write_csv(pts, csv_path)
+    write_do_not_stake_csv(pts, os.path.join(out_dir, "Grade_Grid_DO_NOT_STAKE.csv"))
     write_debug_csv(pts, debug_path)
+    from gradeguard_review import write_cad_review
+    write_cad_review(pts, out_dir, safe, [], cad_path, surface_path=surface_path,
+                     surface=landxml_surface, deduction=float(subtract_amount or 0.0))
     return csv_path, debug_path, len(pts), len([p for p in pts if p.elevation is not None]), len([p for p in pts if p.elevation is None])
 
 
 
-def safe_load_landxml_surface(path: str) -> Optional[LandXMLSurface]:
-    """Load LandXML only when the selected file is actually XML/LandXML.
-
-    Many jobs only have 2D DXF plus 3D contour polylines.  In that workflow the
-    LandXML box should be blank.  If a DXF, PDF, DWG, or bad XML is accidentally
-    left in the surface slot, GradeGuard should keep going and use DXF contours
-    instead of crashing.
-    """
+def safe_load_landxml_surface(path: str, surface_name: str = "") -> Optional[LandXMLSurface]:
+    """An omitted surface is optional; an explicitly selected invalid surface is an error."""
     if not path or not str(path).strip():
         return None
-    ext = os.path.splitext(str(path))[1].lower()
-    if ext not in (".xml", ".landxml"):
-        return None
-    try:
-        return load_landxml_surface(path)
-    except Exception:
-        return None
+    if os.path.splitext(str(path))[1].lower() not in ('.xml', '.landxml'):
+        raise ValueError("Selected surface must be LandXML/XML. Clear the surface box to use DXF contours.")
+    return load_landxml_surface(path, surface_name)
 
 
 def resource_path(filename: str) -> str:
@@ -6126,9 +5792,12 @@ def apply_gradeguard_icon(win):
         pass
 
 class GradeGuardApp(tk.Tk):
-    def __init__(self):
+    def __init__(self, show_splash=False):
         set_gradeguard_app_id()
         super().__init__()
+        self._splash = None
+        if show_splash:
+            self.withdraw()
         self.title(f"Schoel GradeGuard v{APP_VERSION} Multi-Job")
         apply_gradeguard_icon(self)
         self.geometry("1180x820")
@@ -6136,6 +5805,8 @@ class GradeGuardApp(tk.Tk):
 
         self.cad_var = tk.StringVar()
         self.surface_var = tk.StringVar()
+        self.surface_name_var = tk.StringVar()
+        self.unitless_confirm_var = tk.BooleanVar(value=False)
         self.pdf_var = tk.StringVar()
         self.project_var = tk.StringVar(value="Unsaved GradeGuard Project")
         self.out_var = tk.StringVar(value=os.path.join(os.getcwd(), "GradeGuard_Output"))
@@ -6198,236 +5869,30 @@ class GradeGuardApp(tk.Tk):
         self.current_project_file = None
         self._generation_running = False
         self._build()
+        if show_splash:
+            self.show_opening()
+
+    def show_opening(self):
+        if self._splash is not None and self._splash.winfo_exists():
+            self._splash.lift()
+            return
+
+        def open_workspace():
+            self._splash = None
+            self.deiconify()
+            self.lift()
+
+        try:
+            from gradeguard_splash import GradeGuardSplash
+            self._splash = GradeGuardSplash(self, APP_VERSION, resource_path, open_workspace)
+        except Exception as error:
+            # Decorative startup must never prevent access to a user's project.
+            self.deiconify()
+            self.log_msg(f"Opening animation unavailable: {error}")
 
     def _build(self):
-        style = ttk.Style(self)
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-        bg = "#17212e"
-        fg = "#e7edf5"
-        style.configure("TFrame", background=bg)
-        style.configure("TLabel", background=bg, foreground=fg)
-        style.configure("TLabelframe", background=bg, foreground=fg)
-        style.configure("TLabelframe.Label", background=bg, foreground=fg, font=("Arial", 12, "bold"))
-        style.configure("TButton", padding=(10, 7), background="#2f435c", foreground="#ffffff")
-        style.configure("Accent.TButton", padding=(16, 10), background="#6b8e23", foreground="#ffffff", font=("Arial", 13, "bold"))
-        style.configure("TRadiobutton", background=bg, foreground=fg)
-        style.configure("TEntry", fieldbackground="#eef3f8", foreground="#111111")
-
-        # Scrollable main screen so lower sections never get cut off on laptops or lower resolution monitors.
-        outer = ttk.Frame(self)
-        outer.pack(fill="both", expand=True)
-        canvas = tk.Canvas(outer, bg=bg, highlightthickness=0)
-        vscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vscroll.set)
-        vscroll.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        root = ttk.Frame(canvas, padding=14)
-        root_window = canvas.create_window((0, 0), window=root, anchor="nw")
-
-        def _on_frame_configure(event=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def _on_canvas_configure(event):
-            canvas.itemconfigure(root_window, width=event.width)
-
-        def _on_mousewheel(event):
-            # Windows uses event.delta; Linux may use Button-4/Button-5.
-            if getattr(event, "delta", 0):
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        root.bind("<Configure>", _on_frame_configure)
-        canvas.bind("<Configure>", _on_canvas_configure)
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-
-        header = ttk.Frame(root)
-        header.pack(fill="x")
-        self.logo_img = None
-        logo_path = resource_path("gradeguard_logo.png")
-        if os.path.exists(logo_path):
-            try:
-                img = tk.PhotoImage(file=logo_path)
-                factor = max(1, int(img.width()/210))
-                self.logo_img = img.subsample(factor, factor)
-                ttk.Label(header, image=self.logo_img).pack(side="left", padx=(0, 14))
-            except Exception:
-                pass
-        title_box = ttk.Frame(header)
-        title_box.pack(side="left", fill="x", expand=True)
-        ttk.Label(title_box, text="Schoel GradeGuard", font=("Arial", 18, "bold")).pack(anchor="w")
-        ttk.Label(title_box, text="Multi-job workflow: load CAD, load surface, pick/confirm BC, generate BC staking points", font=("Arial", 12)).pack(anchor="w", pady=(2,0))
-        ttk.Label(title_box, text="Tip: use the mouse wheel to scroll this screen if your monitor cuts off lower sections.", font=("Arial", 9, "italic")).pack(anchor="w", pady=(2,0))
-
-
-
-        # BIG VISIBLE OFFSET SECTION.  This stays near the top so it cannot be missed.
-        offset_top = ttk.LabelFrame(root, text="CONTRACTOR OFFSET", padding=14)
-        offset_top.pack(fill="x", pady=(8, 6))
-        ttk.Checkbutton(offset_top, text="Create separate offset CSV and offset line DXF", variable=self.create_offset_var).grid(row=0, column=0, columnspan=2, sticky="w", padx=(0,18))
-        ttk.Label(offset_top, text="Offset distance from BC:", font=("Arial", 10, "bold")).grid(row=0, column=2, sticky="e")
-        ttk.Entry(offset_top, textvariable=self.offset_distance_var, width=10).grid(row=0, column=3, sticky="w", padx=(6,18))
-        ttk.Label(offset_top, text="ft").grid(row=0, column=4, sticky="w")
-        ttk.Label(offset_top, text="Use the single GENERATE BC POINTS button below. Offset files are created when this box is checked.", font=("Arial", 10, "italic")).grid(row=0, column=5, sticky="w", padx=(20,0))
-        ttk.Label(offset_top, text="Offset direction:", font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="w", pady=(8,0))
-        ttk.Radiobutton(offset_top, text="Away from picked FL/gutter", variable=self.offset_mode_var, value="away_from_flowline").grid(row=1, column=1, sticky="w", pady=(8,0))
-        ttk.Radiobutton(offset_top, text="Toward picked FL/gutter", variable=self.offset_mode_var, value="toward_flowline").grid(row=1, column=2, sticky="w", pady=(8,0))
-        ttk.Radiobutton(offset_top, text="Left of BC line", variable=self.offset_mode_var, value="left").grid(row=1, column=3, sticky="w", pady=(8,0))
-        ttk.Radiobutton(offset_top, text="Right of BC line", variable=self.offset_mode_var, value="right").grid(row=1, column=4, sticky="w", pady=(8,0))
-        ttk.Checkbutton(offset_top, text="Flip side", variable=self.offset_reverse_var).grid(row=1, column=5, sticky="w", pady=(8,0), padx=(10,0))
-        ttk.Label(offset_top, text="Optional. Normal BC CSV is always created. Offset CSV and DXF are separate.", font=("Arial", 10, "italic"), wraplength=1040).grid(row=2, column=0, columnspan=6, sticky="w", pady=(8,0))
-        offset_top.columnconfigure(5, weight=1)
-
-        gen_settings_top = ttk.LabelFrame(root, text="Point Numbering and BC Point Spacing", padding=12)
-        gen_settings_top.pack(fill="x", pady=(6, 8))
-        ttk.Label(gen_settings_top, text="Starting point number:", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Entry(gen_settings_top, textvariable=self.start_var, width=12).grid(row=0, column=1, sticky="w", padx=(6,24))
-        ttk.Label(gen_settings_top, text="Distance to add BC points on straight curb:", font=("Arial", 10, "bold")).grid(row=0, column=2, sticky="w")
-        ttk.Entry(gen_settings_top, textvariable=self.spacing_var, width=10).grid(row=0, column=3, sticky="w", padx=(6,6))
-        ttk.Label(gen_settings_top, text="ft").grid(row=0, column=4, sticky="w", padx=(0,24))
-        ttk.Label(gen_settings_top, text="Curb detail from PDF:", font=("Arial", 10, "bold")).grid(row=0, column=5, sticky="w")
-        curb_combo = ttk.Combobox(gen_settings_top, textvariable=self.curb_type_var, values=["Standard curb (+0.50)", "Catch curb per PDF (+0.42)", "Spill curb per PDF (+0.58)", "Custom PDF detail height"], width=24, state="readonly")
-        curb_combo.grid(row=0, column=6, sticky="w", padx=(6,6))
-        ttk.Entry(gen_settings_top, textvariable=self.height_var, width=8).grid(row=0, column=7, sticky="w", padx=(6,4))
-        ttk.Label(gen_settings_top, text="ft").grid(row=0, column=8, sticky="w")
-        def _sync_curb_height(*_args):
-            v = self.curb_type_var.get()
-            if v.startswith("Standard"):
-                self.height_var.set("0.50")
-            elif v.startswith("Catch"):
-                self.height_var.set("0.42")
-            elif v.startswith("Spill"):
-                self.height_var.set("0.58")
-        self.curb_type_var.trace_add("write", _sync_curb_height)
-        ttk.Label(gen_settings_top, text="Curve rule: PC, MID, PT only. Field CSV has no header. Descriptions: BC PC, BC PT, BC HP, BC LP, or BC. v8.4.5 uses standard +0.50 unless the certified PDF detail specifically supports catch +0.42, spill +0.58, or a custom height.", font=("Arial", 10, "italic"), wraplength=1040).grid(row=1, column=0, columnspan=9, sticky="w", pady=(8,0))
-
-        project = ttk.LabelFrame(root, text="Project", padding=10)
-        project.pack(fill="x", pady=(8, 6))
-        ttk.Label(project, textvariable=self.project_var, font=("Arial", 11, "bold")).pack(side="left", fill="x", expand=True, anchor="w")
-        ttk.Button(project, text="New Job", command=self.new_job).pack(side="right", padx=(6,0))
-        ttk.Button(project, text="Open Job", command=self.open_job).pack(side="right", padx=(6,0))
-        ttk.Button(project, text="Save Job", command=self.save_job).pack(side="right", padx=(6,0))
-
-        steps = ttk.LabelFrame(root, text="Start Here", padding=14)
-        steps.pack(fill="x", pady=(6, 6))
-        self._file_row(steps, 0, "1. Main CAD/DXF for geometry, curbs, sidewalk, storm/san", self.cad_var, self.pick_cad)
-        self._file_row(steps, 1, "2. LandXML/XML proposed surface, optional. Leave blank for 2D CAD + contours", self.surface_var, self.pick_surface)
-        self._file_row(steps, 2, "3. Certified civil PDF plan set, REQUIRED for BC", self.pdf_var, self.pick_pdf)
-        self._file_row(steps, 3, "4. Output folder", self.out_var, self.pick_out)
-        pickbar = ttk.Frame(steps)
-        pickbar.grid(row=4, column=0, columnspan=3, sticky="we", pady=(10, 2))
-        ttk.Label(pickbar, text="Generic curb layer? Pick the actual curb components:", font=("Arial", 10, "bold")).pack(side="left", padx=(0, 12))
-        ttk.Button(pickbar, text="PICK TRUE BACK OF CURB", style="Accent.TButton", command=self.pick_back_of_curb_entities).pack(side="left", padx=(0,8))
-        ttk.Button(pickbar, text="PICK FLOWLINE / GUTTER", command=self.pick_flowline_entities).pack(side="left")
-
-        qa = ttk.LabelFrame(root, text="Automatic QA/QC", padding=12)
-        qa.pack(fill="x", pady=(6, 6))
-        ttk.Label(
-            qa,
-            text="Automatic QA/QC requires the civil PDF, keeps PDF callouts/details over CAD/DXF, checks selected BC/FL geometry, builds station-based contour controls, protects HP/LP break points, withholds unsupported elevations, and presents a preflight review before generation.",
-            font=("Arial", 10, "italic"),
-            wraplength=1080,
-        ).grid(row=0, column=0, sticky="w")
-
-        mode = ttk.LabelFrame(root, text="Elevation Source", padding=10)
-        mode.pack(fill="x", pady=(6, 6))
-        mode.columnconfigure(0, weight=1)
-        mode.columnconfigure(1, weight=1)
-
-        src_box = ttk.Frame(mode)
-        src_box.grid(row=0, column=0, sticky="nwe", padx=(0, 18))
-        ttk.Label(src_box, text="Use elevations from:", font=("Arial", 10, "bold")).pack(anchor="w")
-        ttk.Radiobutton(src_box, text="LandXML / Civil 3D surface first", variable=self.source_mode, value="surface").pack(anchor="w")
-        ttk.Radiobutton(src_box, text="3D DXF / Topo-P-Surface first", variable=self.source_mode, value="dxf_surface").pack(anchor="w")
-        ttk.Radiobutton(src_box, text="Contours touching curb only", variable=self.source_mode, value="contours").pack(anchor="w")
-
-        interp_box = ttk.Frame(mode)
-        interp_box.grid(row=0, column=1, sticky="nwe")
-        ttk.Label(interp_box, text="Surface / contour meaning:", font=("Arial", 10, "bold")).pack(anchor="w")
-        ttk.Radiobutton(interp_box, text="Top/back of curb / grading surface: use directly", variable=self.surface_interpret_var, value="bc").pack(anchor="w")
-        ttk.Radiobutton(interp_box, text="Auto: direct BC contours hold, pavement/EP surface adds curb height", variable=self.surface_interpret_var, value="auto").pack(anchor="w")
-        ttk.Radiobutton(interp_box, text="FL/gutter/pavement surface: add curb height to BC", variable=self.surface_interpret_var, value="flowline").pack(anchor="w")
-
-        ttk.Label(mode, text="Rule: picked/held TC/HP/LP points hold first. Contours are secondary. Contour on BC = exact elevation. Contour on FL/gutter = + curb height from the plan detail.", font=("Arial", 10, "italic"), wraplength=1050).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8,0))
-        ttk.Label(mode, text="2D curb workflow: DXF supplies horizontal curb only. Pick True BC and Flowline/Gutter, then use LandXML, CAD contours, PDF detail/callouts, or manual holds for elevations.", font=("Arial", 10, "italic"), wraplength=1050).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4,0))
-
-        flout = ttk.LabelFrame(root, text="Storm / Sanitary FL OUT Points", padding=12)
-        flout.pack(fill="x", pady=(6, 6))
-        ttk.Label(flout, text="Start point:", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Entry(flout, textvariable=self.flout_start_var, width=10).grid(row=0, column=1, sticky="w", padx=(6, 18))
-        ttk.Label(flout, text="Find:", font=("Arial", 10, "bold")).grid(row=0, column=2, sticky="e")
-        ttk.Combobox(flout, textvariable=self.flout_find_var, values=["Both", "Storm", "Sanitary"], width=12, state="readonly").grid(row=0, column=3, sticky="w", padx=(6, 18))
-        ttk.Label(flout, text="Search radius:", font=("Arial", 10, "bold")).grid(row=0, column=4, sticky="e")
-        ttk.Entry(flout, textvariable=self.flout_search_radius_var, width=8).grid(row=0, column=5, sticky="w", padx=(6, 4))
-        ttk.Label(flout, text="ft").grid(row=0, column=6, sticky="w", padx=(0, 18))
-        ttk.Label(flout, text="Description:", font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="w", pady=(8,0))
-        ttk.Combobox(flout, textvariable=self.flout_desc_format_var, values=["Structure + Pipe Size + FL-OUT", "Structure + FL-OUT", "Pipe Size + FL-OUT", "FL-OUT only"], width=32, state="readonly").grid(row=1, column=1, columnspan=3, sticky="w", padx=(6, 18), pady=(8,0))
-        ttk.Button(flout, text="PICK STRUCTURE CENTERS / FL OUT", command=self.pick_flout_centers).grid(row=1, column=4, sticky="e", padx=(12,8), pady=(8,0))
-        ttk.Button(flout, text="GENERATE FL OUT POINTS", style="Accent.TButton", command=self.generate_flout_points).grid(row=1, column=5, columnspan=2, sticky="e", padx=(12,0), pady=(8,0))
-        ttk.Label(flout, text="Creates a separate CSV with no header. Auto mode reads structure centers from DXF and lowest OUT invert/flowline from CAD/PDF labels. If structures do not export cleanly, click PICK STRUCTURE CENTERS / FL OUT and key the label, pipe size, and FL OUT elevation.", font=("Arial", 10, "italic"), wraplength=1050).grid(row=2, column=0, columnspan=7, sticky="w", pady=(8,0))
-        flout.columnconfigure(4, weight=1)
-
-
-        esw = ttk.LabelFrame(root, text="Edge of Sidewalk Staking", padding=12)
-        esw.pack(fill="x", pady=(6, 6))
-        ttk.Label(esw, text="Start point:", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Entry(esw, textvariable=self.esw_start_var, width=10).grid(row=0, column=1, sticky="w", padx=(6, 18))
-        ttk.Label(esw, text="Spacing on straight sidewalk edge:", font=("Arial", 10, "bold")).grid(row=0, column=2, sticky="e")
-        ttk.Entry(esw, textvariable=self.esw_spacing_var, width=10).grid(row=0, column=3, sticky="w", padx=(6, 4))
-        ttk.Label(esw, text="ft").grid(row=0, column=4, sticky="w", padx=(0, 18))
-        ttk.Label(esw, text="Description:", font=("Arial", 10, "bold")).grid(row=0, column=5, sticky="e")
-        ttk.Entry(esw, textvariable=self.esw_desc_var, width=16).grid(row=0, column=6, sticky="w", padx=(6, 18))
-        ttk.Button(esw, text="PICK EDGE OF SIDEWALK", command=self.pick_edge_sidewalk_entities).grid(row=0, column=7, sticky="e", padx=(12, 8))
-        ttk.Button(esw, text="GENERATE EDGE OF SIDEWALK POINTS", style="Accent.TButton", command=self.generate_edge_sidewalk_points).grid(row=0, column=8, sticky="e")
-
-        ttk.Label(esw, text="2D sidewalk workflow:", font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="w", pady=(8,0))
-        ttk.Label(esw, text="Leave LandXML blank if there is no XML surface. Pick the sidewalk edge, then use 3D DXF contour layers such as P-Topo Major Contours / P-Topo Minor Contours for elevations.", font=("Arial", 10, "italic"), wraplength=950).grid(row=1, column=1, columnspan=8, sticky="w", pady=(8,0))
-
-        ttk.Label(esw, text="Cross slope:", font=("Arial", 10, "bold")).grid(row=2, column=0, sticky="w", pady=(8,0))
-        ttk.Entry(esw, textvariable=self.esw_cross_slope_var, width=8).grid(row=2, column=1, sticky="w", padx=(6,4), pady=(8,0))
-        ttk.Label(esw, text="%",).grid(row=2, column=1, sticky="w", padx=(70,0), pady=(8,0))
-        ttk.Label(esw, text="Sidewalk width:", font=("Arial", 10, "bold")).grid(row=2, column=2, sticky="e", pady=(8,0))
-        ttk.Entry(esw, textvariable=self.esw_width_var, width=8).grid(row=2, column=3, sticky="w", padx=(6,4), pady=(8,0))
-        ttk.Label(esw, text="ft",).grid(row=2, column=4, sticky="w", pady=(8,0))
-        ttk.Label(esw, text="Adjustment:", font=("Arial", 10, "bold")).grid(row=2, column=5, sticky="e", pady=(8,0))
-        ttk.Combobox(esw, textvariable=self.esw_adjust_var, values=["direct", "auto from contours", "add cross slope", "subtract cross slope"], width=18, state="readonly").grid(row=2, column=6, columnspan=2, sticky="w", padx=(6,18), pady=(8,0))
-
-        ttk.Label(esw, text="Use direct when the selected edge elevation is being calculated. Auto samples perpendicular left/right of the linear sidewalk run to help determine which way water falls. Cross slope is always perpendicular to the walk. Example: 10 ft sidewalk at 1% = 0.10 ft elevation difference.", font=("Arial", 10, "italic"), wraplength=1150).grid(row=3, column=0, columnspan=9, sticky="w", pady=(8,0))
-        esw.columnconfigure(8, weight=1)
-
-        grade_grid = ttk.LabelFrame(root, text="Subgrade / Finished Grade Grid", padding=12)
-        grade_grid.pack(fill="x", pady=(6, 6))
-        ttk.Label(grade_grid, text="Grid type:", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(grade_grid, text="SUBGRADE", variable=self.grade_grid_type_var, value="SUBGRADE").grid(row=0, column=1, sticky="w", padx=(6, 12))
-        ttk.Radiobutton(grade_grid, text="FINISHED GRADE", variable=self.grade_grid_type_var, value="FINISHED GRADE").grid(row=0, column=2, sticky="w", padx=(0, 18))
-        ttk.Label(grade_grid, text="Start point:", font=("Arial", 10, "bold")).grid(row=0, column=3, sticky="e")
-        ttk.Entry(grade_grid, textvariable=self.grade_grid_start_var, width=10).grid(row=0, column=4, sticky="w", padx=(6, 18))
-        ttk.Label(grade_grid, text="Grid spacing:", font=("Arial", 10, "bold")).grid(row=0, column=5, sticky="e")
-        ttk.Entry(grade_grid, textvariable=self.grade_grid_spacing_var, width=10).grid(row=0, column=6, sticky="w", padx=(6, 4))
-        ttk.Label(grade_grid, text="ft").grid(row=0, column=7, sticky="w")
-        ttk.Label(grade_grid, text="Subtract from finished grade:", font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="w", pady=(8,0))
-        ttk.Entry(grade_grid, textvariable=self.grade_grid_subtract_var, width=10).grid(row=1, column=1, sticky="w", padx=(6, 4), pady=(8,0))
-        ttk.Label(grade_grid, text="ft  (used for SUBGRADE; set 0.00 for FINISHED GRADE)").grid(row=1, column=2, columnspan=4, sticky="w", pady=(8,0))
-        ttk.Button(grade_grid, text="GENERATE GRADE GRID", style="Accent.TButton", command=self.generate_grade_grid).grid(row=1, column=6, columnspan=2, sticky="e", padx=(12,0), pady=(8,0))
-        ttk.Label(grade_grid, text="Creates a separate CSV with no header. Description is SUBGRADE or FINISHED GRADE. Uses LandXML / Topo-P-Surface / contours as finished grade, then subtracts the amount you enter.", font=("Arial", 10, "italic"), wraplength=1050).grid(row=2, column=0, columnspan=8, sticky="w", pady=(8,0))
-        grade_grid.columnconfigure(2, weight=1)
-
-        action = ttk.Frame(root)
-        action.pack(fill="x", pady=12)
-        ttk.Button(action, text="Auto Detect BC Layers", command=self.detect_layers).pack(side="left", padx=(0,8))
-        ttk.Label(action, text="Pick tools are in each section: BC/FL in Start Here, Storm/San in FL OUT, and Sidewalk in Edge of Sidewalk.", font=("Arial", 10, "italic")).pack(side="left", padx=(10,0))
-        self.generate_button = ttk.Button(action, text="GENERATE BC POINTS", style="Accent.TButton", command=self.generate)
-        self.generate_button.pack(side="right")
-
-        self.layer_box = tk.Text(root, height=4, wrap="word", bg="#0f1722", fg="#e7edf5", insertbackground="#e7edf5")
-        self.layer_box.pack(fill="x", pady=(2, 10))
-        self.layer_box.insert("1.0", 'BC layer detection will appear here. If the engineer uses generic layers like P-CURB, P-CURBS, HARDSCAPE, SITE-HARDSCAPE, or puts face, gutter, and back of curb all on one layer, click "Pick True Back of Curb in DXF" and manually select only the back-of-curb objects. If contours hit the gutter/flowline instead, click "Pick Flowline/Gutter in DXF" too. Contour on BC = exact elevation. Contour on FL/gutter = + verified catch/spill/custom curb height from the PDF detail. In 2D CAD, linework is geometry only, so use LandXML/CAD contours/PDF callouts/manual holds for elevations. For edge-of-sidewalk staking, use the Edge of Sidewalk section. GradeGuard looks for ANY layer name containing SIDEWALK, and verify sidewalk/turn-down/ramp details in the PDF scan report.')
-
-        self.log = tk.Text(root, height=7, wrap="word", bg="#0f1722", fg="#e7edf5", insertbackground="#e7edf5")
-        self.log.pack(fill="both", expand=True, pady=(2, 0))
-        self.log_msg("Ready. Multi-job mode. Use LandXML/Civil 3D surface whenever possible. DXF remains fixed and is never scaled.")
+        from gradeguard_ui import WorkflowView
+        self._workflow = WorkflowView(self, APP_VERSION, resource_path)
 
     def _file_row(self, parent, row, label, var, cmd):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=5)
@@ -6483,9 +5948,11 @@ class GradeGuardApp(tk.Tk):
 
     def _project_data(self):
         return {
-            "version": "8.5.5",
+            "version": APP_VERSION,
             "cad_path": self.cad_var.get().strip(),
             "surface_path": self.surface_var.get().strip(),
+            "surface_name": self.surface_name_var.get().strip(),
+            "unitless_us_survey_feet_confirmed": bool(self.unitless_confirm_var.get()),
             "pdf_path": self.pdf_var.get().strip(),
             "out_dir": self.out_var.get().strip(),
             "start_point": self.start_var.get().strip(),
@@ -6523,11 +5990,25 @@ class GradeGuardApp(tk.Tk):
             "anchor_path": self.anchor_path,
             "selected_curb_path": self.selected_curb_path,
             "selected_flowline_path": self.selected_flowline_path,
+            "selected_sidewalk_path": self.selected_sidewalk_path,
+            "manual_flout_path": self.manual_flout_path,
+            "sidewalk_start": self.esw_start_var.get(),
+            "sidewalk_spacing": self.esw_spacing_var.get(),
+            "sidewalk_description": self.esw_desc_var.get(),
+            "sidewalk_cross_slope": self.esw_cross_slope_var.get(),
+            "sidewalk_width": self.esw_width_var.get(),
+            "sidewalk_auto_width": bool(self.esw_auto_width_var.get()),
+            "sidewalk_adjustment": self.esw_adjust_var.get(),
+
         }
 
     def _load_project_data(self, data):
+        self.last_calculation_review = ''
         self.cad_var.set(data.get("cad_path", ""))
+        reset_generation_state()
         self.surface_var.set(data.get("surface_path", ""))
+        self.surface_name_var.set(data.get("surface_name", ""))
+        self.unitless_confirm_var.set(bool(data.get("unitless_us_survey_feet_confirmed", False)))
         self.pdf_var.set(data.get("pdf_path", ""))
         self.out_var.set(data.get("out_dir", os.path.join(os.getcwd(), "GradeGuard_Output")))
         self.start_var.set(str(data.get("start_point", "6000")))
@@ -6561,8 +6042,28 @@ class GradeGuardApp(tk.Tk):
         self.anchor_path = data.get("anchor_path", os.path.join(os.getcwd(), "GradeGuard_Tick_Anchors.json"))
         self.selected_curb_path = data.get("selected_curb_path", os.path.join(os.getcwd(), "GradeGuard_Selected_BC_Entities.json"))
         self.selected_flowline_path = data.get("selected_flowline_path", os.path.join(os.getcwd(), "GradeGuard_Selected_Flowline_Entities.json"))
+        self.esw_start_var.set(data.get('sidewalk_start', '9000'))
+        self.esw_spacing_var.set(data.get('sidewalk_spacing', '25'))
+        self.esw_desc_var.set(data.get('sidewalk_description', 'SIDEWALK'))
+        self.esw_cross_slope_var.set(data.get('sidewalk_cross_slope', '1.00'))
+        self.esw_width_var.set(data.get('sidewalk_width', '5.00'))
+        self.esw_auto_width_var.set(data.get('sidewalk_auto_width', True))
+        self.esw_adjust_var.set(data.get('sidewalk_adjustment', 'direct'))
+        self.flout_start_var.set(data.get('flout_start', '7000'))
+        self.flout_find_var.set(data.get('flout_find', 'Both'))
+        self.flout_desc_format_var.set(data.get('flout_desc_format', 'Structure + Pipe Size + FL-OUT'))
+        self.flout_search_radius_var.set(data.get('flout_search_radius', '120'))
+        self.selected_sidewalk_path = data.get('selected_sidewalk_path', os.path.join(os.getcwd(), 'GradeGuard_Selected_Edge_Sidewalk_Entities.json'))
+        self.manual_flout_path = data.get('manual_flout_path', os.path.join(os.getcwd(), 'GradeGuard_Manual_FL_OUT_Points.json'))
 
     def new_job(self):
+        self.last_calculation_review = ''
+        reset_generation_state()
+        self.surface_name_var.set("")
+        self.unitless_confirm_var.set(False)
+        self.selected_flowline_path = os.path.join(os.getcwd(), "GradeGuard_Selected_Flowline_Entities.json")
+        self.selected_sidewalk_path = os.path.join(os.getcwd(), "GradeGuard_Selected_Edge_Sidewalk_Entities.json")
+        self.manual_flout_path = os.path.join(os.getcwd(), "GradeGuard_Manual_FL_OUT_Points.json")
         self.current_project_file = None
         self.project_var.set("Unsaved GradeGuard Project")
         self.cad_var.set("")
@@ -6596,6 +6097,17 @@ class GradeGuardApp(tk.Tk):
         self.layer_box.delete("1.0", "end")
         self.layer_box.insert("1.0", "New job started. Pick DXF, LandXML/XML, and output folder. If the curb layer is generic like P-CURB, use Pick True Back of Curb in DXF.")
         self.log_msg("New GradeGuard job started.")
+        self.esw_start_var.set('9000')
+        self.esw_spacing_var.set('25')
+        self.esw_desc_var.set('SIDEWALK')
+        self.esw_cross_slope_var.set('1.00')
+        self.esw_width_var.set('5.00')
+        self.esw_auto_width_var.set(True)
+        self.esw_adjust_var.set('direct')
+        self.flout_start_var.set('7000')
+        self.flout_find_var.set('Both')
+        self.flout_desc_format_var.set('Structure + Pipe Size + FL-OUT')
+        self.flout_search_radius_var.set('120')
 
     def save_job(self):
         path = self.current_project_file
@@ -6632,16 +6144,39 @@ class GradeGuardApp(tk.Tk):
         p = filedialog.askopenfilename(title="Pick Civil CAD DXF", filetypes=[("DXF files", "*.dxf"), ("DWG files", "*.dwg"), ("All files", "*.*")])
         if p:
             self.cad_var.set(p)
+            self.unitless_confirm_var.set(False)
+            reset_generation_state()
 
     def pick_surface(self):
         p = filedialog.askopenfilename(title="Pick LandXML Surface", filetypes=[("LandXML/XML", "*.xml *.landxml"), ("All files", "*.*")])
         if p:
             self.surface_var.set(p)
+            self.surface_name_var.set("")
+            try:
+                names = [el.attrib.get('name','') for el in ET.parse(p).getroot().iter() if _xml_local(el.tag) == 'Surface']
+                if len(names) == 1:
+                    self.surface_name_var.set(names[0])
+                else:
+                    self.log_msg("LandXML surface names: " + ", ".join(names))
+                if hasattr(self, 'surface_name_combo'):
+                    self.surface_name_combo.configure(values=names)
+            except Exception as ex:
+                self.log_msg("Surface selection could not be read: " + str(ex))
 
     def pick_pdf(self):
         p = filedialog.askopenfilename(title="Pick PDF plan set", filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")])
         if p:
             self.pdf_var.set(p)
+
+    def review_pdf_grades(self):
+        if not os.path.isfile(self.pdf_var.get().strip()):
+            messagebox.showerror('Read PDF grades', 'Choose a local PDF plan set first.')
+            return
+        try:
+            from gradeguard_pdf_ui import PdfReviewWindow
+            PdfReviewWindow(self)
+        except Exception as ex:
+            messagebox.showerror('Read PDF grades', str(ex))
 
     def pick_out(self):
         p = filedialog.askdirectory(title="Pick output folder")
@@ -7390,7 +6925,11 @@ class GradeGuardApp(tk.Tk):
             if not all_pts:
                 messagebox.showwarning("No graphics", "No readable DXF graphics found.")
                 return
-            manual=load_manual_flout_points(self.manual_flout_path)
+            try:
+                manual=load_manual_flout_points(self.manual_flout_path, cad)
+            except ValueError as ex:
+                manual=[]
+                self.log_msg(str(ex) + ' Starting a fresh manual structure selection.')
             all_layers = sorted({str(e.get("layer") or "0") for e in entities}, key=lambda x: x.lower())
             active_layers = set(all_layers)
             win=tk.Toplevel(self)
@@ -7625,6 +7164,7 @@ class GradeGuardApp(tk.Tk):
                 desc_format=self.flout_desc_format_var.get(),
                 search_radius=float(self.flout_search_radius_var.get()),
                 manual_path=self.manual_flout_path,
+                units_confirmed=bool(self.unitless_confirm_var.get()),
             )
             self.log_msg(f"Generated FL OUT points: {total}")
             self.log_msg(f"Points with elevations: {assigned}")
@@ -7670,6 +7210,8 @@ class GradeGuardApp(tk.Tk):
                 cad_path=cad,
                 pdf_path=self.pdf_var.get().strip(),
                 surface_path=self.surface_var.get().strip(),
+                surface_name=self.surface_name_var.get().strip(),
+                units_confirmed=bool(self.unitless_confirm_var.get()),
                 out_dir=self.out_var.get().strip(),
                 start_pt=int(float(self.esw_start_var.get())),
                 spacing=float(self.esw_spacing_var.get()),
@@ -7712,6 +7254,8 @@ class GradeGuardApp(tk.Tk):
             csv_path, debug_path, total, assigned, missing = run_grade_grid_generation(
                 cad_path=cad,
                 surface_path=self.surface_var.get().strip(),
+                surface_name=self.surface_name_var.get().strip(),
+                units_confirmed=bool(self.unitless_confirm_var.get()),
                 out_dir=self.out_var.get().strip(),
                 start_pt=int(float(self.grade_grid_start_var.get())),
                 grid_spacing=float(self.grade_grid_spacing_var.get()),
@@ -7789,6 +7333,9 @@ class GradeGuardApp(tk.Tk):
                 manual_anchor_path=anchor_path,
                 require_manual_pdf_spots=True,
                 surface_path=surface,
+                source_policy=self.source_mode.get(),
+                surface_name=self.surface_name_var.get().strip(),
+                units_confirmed=bool(self.unitless_confirm_var.get()),
                 surface_mode=self.surface_interpret_var.get(),
                 selected_curb_path=self.selected_curb_path,
                 selected_flowline_path=self.selected_flowline_path,
@@ -7824,11 +7371,15 @@ class GradeGuardApp(tk.Tk):
 
     def _reset_generation_ui(self):
         self._generation_running = False
-        self.generate_button.configure(state="normal", text="GENERATE BC POINTS")
+        self.generate_button.configure(state="normal", text="Review & generate BC points")
+        self._workflow.set_busy(False)
         self.config(cursor="")
 
     def _generation_finished(self, result, out):
+        review = os.path.join(out, 'Calculation-Review.json')
+        self.last_calculation_review = review if os.path.isfile(review) else ''
         self._reset_generation_ui()
+        self._workflow.show_results()
         csv_path, debug_csv_path, report_path, total, issues, assigned = result
         try:
             self.log_msg(f"Generated points: {total}")
@@ -7849,11 +7400,12 @@ class GradeGuardApp(tk.Tk):
 
     def _generation_failed(self, error, details):
         self._reset_generation_ui()
+        self._workflow.show_results()
         self.log_msg("ERROR:")
         self.log_msg(error)
         self.log_msg(details)
         messagebox.showerror("Error", error)
 
 if __name__ == "__main__":
-    app = GradeGuardApp()
+    app = GradeGuardApp(show_splash=True)
     app.mainloop()

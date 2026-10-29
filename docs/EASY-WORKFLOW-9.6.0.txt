@@ -1,0 +1,61 @@
+SCHOEL GRADEGUARD 9.6.0 - THREE STEPS
+Local guided workflow pilot, 2026-10-29
+
+1. OPEN PLANS
+   Choose the plan PDF. If you have a matching DXF and/or LandXML, check the
+   extra-files option and choose them. Continue opens the appropriate workflow.
+2. CALCULATE
+   With CAD: choose curb, sidewalk and/or grade grid and calculate together.
+   Review the displayed spacing, curb rise and surface interpretation first.
+   With PDF only: follow Sheet & scale, Paths & grades, Calculate & review.
+   Next buttons explain what is needed. Known-distance mode hides survey
+   coordinate fields. Grade meanings use plain words from the plan legend.
+   Save setup to reuse a checked sheet without repeating all the picks.
+3. REVIEW RESULTS
+   After calculating, choose Inspect points & profiles. From the home screen,
+   Review results opens the current run, or lets you choose a saved
+   Calculation-Review.json. Packages created before 9.6 need recalculation
+   to include this new review file.
+
+ADVANCED SETTINGS
+Use Advanced settings to access Files & setup and Tool settings. Individual
+curb, sidewalk, structure and grid tools remain available there. New/Open/Save
+job remain at the top. PDF setup files and main job files remain separate.
+LandXML without a DXF does not provide path geometry: use the guided PDF
+workflow for curb/sidewalk paths, or the existing advanced surface/grid tool.
+
+POINT REVIEW
+Click a point on the plan, point list or profile. Selection stays linked.
+Choose a path to see elevation versus distance along it. Arrows point toward
+the lower grade; signed slope is 100 times rise divided by station distance.
+The vertical scale is exaggerated and is labeled accordingly.
+Green means accepted by the existing export checks, gold means calculated
+for review/withheld, red means missing. Missing elevations stay blank and
+break the profile; disconnected runs are not joined. CAD branches shared by
+several runs are flagged instead of assigning an arbitrary profile station.
+Grid points and curb offsets do not acquire a fabricated path profile.
+
+PDF interpolation records the actual bracket stations and elevations, held
+HP/LP controls, and the entered curb conversion. Top/back grades hold directly;
+flowline grades add the verified local rise once. Triangle-based surface
+evidence shows vertices, barycentric weights and one subgrade deduction.
+Other CAD methods retain original engine source/QA text where intermediate
+operands are unavailable. The viewer never guesses those missing operands.
+
+View PDF evidence opens the actual printed callout or the manually located
+tick area. Source fingerprints must match; changed/missing plans disable
+the PDF background/evidence and flag results as historical. Inspection does
+not edit source plans, recalculate grades, change acceptance or approve points.
+
+COLORS AND OPENING
+The main workspace, calculation windows and review screens use the opening
+screen's navy, muted green and gold. Plan paper remains white. Replay opening
+still shows the animated dozer. Small home windows can scroll to every action.
+
+LIMITS
+PDF-only calculations still need a checked scale, units, reference, selected
+paths and verified grade meanings/locations. They are office-review outputs,
+not approved field files. Spot-only grids do not supply design breaklines.
+Software tests are not field-accuracy validation. See AUTO-CALCULATE-9.5.0.txt
+for the underlying calculation workflow and CALCULATION-FIXES-9.3.1.txt for
+the existing export/calculation safeguards.

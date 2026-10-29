@@ -1,0 +1,87 @@
+GRADEGUARD 9.4.0 - PDF GRADE REVIEW PILOT
+October 28, 2026
+
+WHAT THE PROGRAM NOW READS
+Read PDF grades scans every sheet and lists printed grade observations with
+page numbers, original text, labels, values and an image of the source area.
+It supports prefix, suffix, stacked, dotted and combined labels, including
+TC, BC, TBC, BOC, FL/GUT, HP/LP, HPS/LPS, FS/FG, RIM, walls and floor grades.
+Bare decimal spots are no longer limited to one project's 730-749 range.
+Use the high/low filter, curb filter, page filter or search to find callouts.
+
+Some labels are scanned or drawn shapes. OCR this page uses locally installed
+Tesseract, when available, and sends no document to a service. OCR is optional,
+not bundled. It can miss rotated/overlapping labels or misread digits. Key a
+missed callout provides a manual fallback. Integer-only and unusual notation
+may also need manual entry. Review every relevant sheet visually.
+
+HOW TOP/BACK-OF-CURB GRADES WORK
+The plan legend and local section detail govern the meaning. TC, BC and BOC
+are not universal conventions. HP/LP may describe ground, pavement or swales,
+not necessarily the curb. A finish-surface or rim grade is not automatically a
+curb control. Legends can contain example elevations that are not site points.
+
+For a verified top/back-of-curb callout, hold the printed elevation directly.
+For a verified lower curb/flowline/gutter callout, add the local vertical rise
+to the requested curb top exactly once. Do not assume six inches everywhere.
+Use an explicitly entered zero rise for a confirmed flush curb. The review
+stores the original observation, corrected value if needed, meaning, rise,
+resulting top grade, CAD coordinates and reference note.
+
+The highlighted text box is evidence only, not a physical point. Enter the
+Easting/Northing of the intended back-of-curb tick in the matching CAD drawing.
+For a lower grade on a separate flowline, confirm the corresponding curb
+station and detail before entering that curb point. The program does not
+infer this relationship from a nearby label or register sheets by extents.
+
+WORKFLOW
+1. Choose the PDF and matching DXF under Project files. Check source units and
+   the benchmark/vertical reference. The current engine uses US survey feet.
+2. Click Read PDF grades / review curb controls. Inspect the printed callout,
+   leader, legend and applicable curb detail using the image and whole sheet.
+3. Choose the verified meaning and curb point type. Enter the printed grade,
+   exact CAD curb E/N and local rise when converting a lower grade. Enter the
+   legend/detail and benchmark/reference checked. Confirm the review box.
+4. Accept / update each control, then Save reviewed curb controls. Save the
+   job to retain the control-file selection. Accept changes before saving;
+   editing fields alone does not replace an accepted control.
+5. Select the actual BC geometry and generate curb points. Newly reviewed
+   controls farther than the existing 0.35-foot association tolerance from BC
+   stop the run. Review generated grades, source records and field exclusions.
+
+SAFETY AND FILES
+No detected PDF value is promoted automatically. New control files require
+matching PDF and DXF SHA-256 fingerprints, confirmed units/reference, finite
+coordinates and a consistent elevation conversion. Changes require re-review.
+Saving keeps the prior control file as .bak. Remove hold and save to revoke it.
+Unaccepted observations and exported review CSVs are not staking points.
+Raw PDFs, DXFs, coordinate systems and datums are not altered or transformed.
+Legacy manual-anchor files retain their earlier DXF-bound behavior; open this
+screen and re-review their values to gain the new PDF provenance protection.
+PDF controls currently feed curb staking. Other tools and CAD-label conventions
+retain existing behavior. General ground/swale grades remain review evidence.
+
+PUBLIC PLAN TESTS
+- Mesa Verde High School Athletic Facility Improvements, public California
+  CEQAnet attachment: 21 pages. Ten selected values on pages 2-4 were checked
+  against rendered callouts, including HPS 141.30, LPS 141.55 and TC 142.43.
+- Crystal Clean site improvements, North Royalton public PC24-10 packet:
+  28 pages. C4.0-C4.2 provide grading legends and drawn callouts. Text extraction
+  misses drawn labels; page-25 OCR produced incorrect 6/8 digits and incomplete
+  recognition. That result is documented as a limitation, not a successful
+  complete plan read. A review/entry route remains necessary.
+
+The corpus includes legends, existing elevations and other numbers; total
+observation counts are not counts of valid proposed grades. No matching public
+DXF/control was obtained. Coordinate placement and field-export checks used
+synthetic test drawings, not these public projects. Tests do not establish
+field accuracy or replace project-specific professional review.
+
+REPRODUCE
+python -m unittest discover -s tests -v
+python tests/calculation_audit.py --report <new-results.json>
+python tests/check_public_pdfs.py --corpus <public-plan-folder> --report <results.json>
+
+Local unsigned pilot executable. Existing dozer opening retained. Prior 9.3.1
+build/source/reports are preserved in the dated GradeGuard archive. No Git push,
+MSI installation or publication is part of this update.
