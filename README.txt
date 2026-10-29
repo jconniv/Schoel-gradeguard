@@ -1,3 +1,17 @@
+Schoel GradeGuard v9.6.0 - Guided Workflow Pilot
+
+Start with Open plans, Calculate, Review results. Use Advanced settings
+for detailed file and tool options. Click a calculated point to inspect
+its source and grade profile. See docs/EASY-WORKFLOW-9.6.0.txt.
+Use the combined DXF/PDF workflow or the calibrated PDF-only workspace.
+See README.md, docs/HOW-TO.md and docs/AUTO-CALCULATE-9.5.0.txt.
+PDF-only results remain review outputs; initial scale, linework and controls
+must be checked. Delivered test records document software verification.
+The animated dozer opening remains available.
+
+HISTORICAL README FOLLOWS. Older default/export descriptions below are
+release history, not instructions for the current preview.
+
 Schoel GradeGuard v9.0.3
 
 Release validation:

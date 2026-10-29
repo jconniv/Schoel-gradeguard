@@ -1,0 +1,79 @@
+SCHOEL GRADEGUARD 9.5.0 - AUTOMATIC CALCULATIONS
+
+Open Project files > Auto calculate curb, sidewalk & grade.
+The opening dozer animation and existing individual tools remain available.
+
+DXF + PDF WORKFLOW
+1. Select the matching DXF/PDF, optional approved LandXML surface, and output
+   folder. Check project units, vertical reference, source currency and details.
+2. Set curb, sidewalk and grade-grid options in Staking tools. Existing geometry
+   selections and reviewed PDF curb controls are used when supplied.
+3. Open Auto calculate. Choose the tools and Calculate selected tools.
+   All tools use the current settings. Point numbering starts at the curb start
+   number and continues across tools, reserving offset IDs as well.
+4. Review Calculation-Summary.html and each tool's reports. The combined field
+   CSV contains only rows accepted by the existing export gate, including
+   enabled approved curb offsets. Withheld points remain in individual review
+   files. A failed tool is reported; other selected tools can still complete.
+   No source PDF is presumed fully interpreted by running this batch.
+
+PDF-ONLY WORKFLOW
+1. Open PDF calculation workspace. Select the PDF, sheet number and output.
+   Each sheet has its own saved setup. No DXF is required.
+2. Pick two calibration points. For local coordinates, enter the known distance
+   between them. Point 1 is local (0,0) and point 2 lies on +X. This is not a
+   survey coordinate system. For survey coordinates, enter two Easting/Northing
+   pairs plus an independent third check away from the baseline and a check
+   tolerance. Pick the corresponding three positions on the PDF.
+3. Confirm US survey feet and record the checked scale/control and vertical
+   reference. Check calibration. No units or datum conversion is performed.
+4. On Paths & grades, choose CURB or SIDEWALK, then Select vector and click the
+   relevant line. For fragmented/scanned linework, use Trace path, click the
+   vertices and Finish trace. Vector curves are flattened to 0.10 PDF-point
+   tolerance; traced geometry does not gain survey precision from calibration.
+   Closed paths must repeat the first position at the end (vector closed paths
+   retain their closure). Distinct paths require their own grade controls.
+5. Read PDF text, or optionally OCR this sheet with local Tesseract. Select a
+   candidate, verify/correct the printed elevation, and choose its meaning:
+     CURB_TOP: the printed top/back grade is used directly.
+     CURB_FL: add the explicitly entered local rise once (0 for verified flush).
+     SIDEWALK: hold the printed sidewalk grade directly on its selected path.
+     FG: finished grade used for the review grid, not a curb anchor.
+   Select Spot, HP or LP and the correct path. Locate grade at leader/tick,
+   then click the actual controlling position. Do not click the text center.
+   HP/LP role records the design hold; it does not certify drainage compliance.
+   A bare BOC, swale HP, rim or other label needs interpretation from the legend.
+6. For a grade grid, draw a boundary and locate at least three noncollinear FG
+   controls within it. On Calculate & review, choose spacing, initial point
+   number, association tolerance and optional subgrade deduction.
+7. Auto calculate this sheet. Curb/sidewalk values interpolate along actual
+   selected path station, with vertices and control stations included. The
+   slope-to-next column is signed percent in increasing station order. Missing
+   controls leave blank elevations; no open-path extrapolation is performed.
+   Closed paths interpolate around closure only with two distinct controls.
+8. Save setup to reuse the calibration, paths and controls. The setup is bound
+   to the PDF SHA-256, so changed plan content must be reviewed again.
+
+OUTPUTS AND LIMITS
+- Both routes create a new dated output folder, summary HTML and JSON.
+- PDF-only exports use a headered CALCULATED_REVIEW_ONLY CSV. Local XY are
+  explicitly distinguished from survey Easting/Northing. No PDF-only result is
+  placed in the combined approved field CSV.
+- A spot-based PDF grid is a provisional triangulation without design
+  breaklines. It stops at its control triangles and selected boundary; gaps
+  stay blank. It is not a reconstruction of every designed slope or contour.
+- PDF text/OCR can miss or misread numbers and include legend/existing grades.
+  Geometry classification, OCR reading, grade meaning and leader association
+  are not unattended. The initial sheet setup needs office review.
+- This version does not infer sidewalk cross slope, ramps or accessibility
+  compliance from PDF graphics. Trace/control each relevant edge explicitly.
+  The existing DXF sidewalk options retain their prior behavior.
+- Only software calculations and known-answer fixtures are verified. Actual
+  project comparisons and appropriate professional review remain required.
+- No source drawing, PDF, survey observation, coordinate datum or Git remote is
+  edited. This is a local unsigned build, not a signed installation release.
+
+VALIDATION
+See the delivered Regression-Tests.txt, Audit-Results.json and public-plan
+records. Public plans test reading and display; synthetic plans test known
+coordinates and calculated answers. Neither establishes field accuracy.

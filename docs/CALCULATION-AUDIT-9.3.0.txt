@@ -1,0 +1,332 @@
+SCHOEL GRADEGUARD 9.3.0 - CALCULATION AND WORKFLOW AUDIT
+Audit date: October 28, 2026
+Status: UNRESOLVED CALCULATION / DATA-INTEGRITY FINDINGS
+
+Conclusion
+----------
+Do not treat the current preview as validated for unattended field staking.
+The underlying elementary math works in many tested examples, but source
+selection, geometry interpretation, topology, control preservation, and export
+gating have reproducible failures. These can change actual field coordinates or
+elevations; they are not only wording or interface issues.
+
+The original 19 tests pass. A new, deliberately adversarial audit contains 78
+checks: 40 pass, 38 fail, zero execution errors. Several checks reproduce the
+same underlying defect at different levels. These counts are not 38 distinct
+bugs and are not an estimate of the percentage of real jobs that are correct.
+
+This is an audit, not a corrected release. Application code, calculations,
+deployed executable, and shortcuts remain unchanged at 9.3.0. Added files are
+the reproducible audit runner and this report, with a validation changelog entry.
+No real project, original survey record, or field data was modified.
+
+How the program actually works
+-----------------------------
+GradeGuard is a local Python/Tk application. schoel_gradeguard.py contains the
+calculation engine, import/export functions, job state, and selection windows.
+gradeguard_ui.py presents four tools. gradeguard_splash.py is presentation only.
+It prepares design-derived stake coordinates from engineer-supplied sources;
+it does not perform a survey adjustment, certify the design, model hydraulics,
+or calculate earthwork volumes.
+
+1. DXF supplies XY geometry. Internal XY means Easting, Northing. LINEs are
+   sampled at requested spacing. Curves normally get PC, midpoint, and PT;
+   denser tessellation supports intersections and picking. True BC and FL may
+   be selected by entity handle, otherwise layer-name rules select objects.
+   Text labels, contour Z, surface edges, and leader-like lines are extracted.
+
+2. Elevation evidence comes from CAD text, manually entered PDF tick anchors,
+   automatically matched PDF callouts, LandXML faces/feature lines, and DXF
+   contours/surface edges. Automatic PDF matching uses coordinate-label text
+   centers, or falls back to matching sheet/CAD extents. The ordinary GUI keeps
+   general automatic PDF spots disabled, while separately screening automatic
+   HP/LP labels using an alignment RMSE and vector-leader gate.
+
+3. Curb generation first creates spacing/curve/control/intersection points.
+   assign_elevations evaluates held labels, exact overrides, selected BC/FL
+   contour controls, local contour interpolation, LandXML, contour TIN, and
+   nearby fallback sources. Actual implementation does NOT consistently match
+   the documented claim that supplied LandXML is the preferred non-PDF source.
+
+4. The curb result then passes through HP/LP hard holds, temporary contour
+   surface corrections, flow tagging, station-profile corrections, nearby
+   contour holds, profile rebuilding, a second surface correction, missing-grade
+   filling, another flow pass, HP/LP clustering, the sanitizer, and another
+   hard-hold pass. Several stages mutate the same elevation and append text to
+   its provenance. A correct initial value can be lost later.
+
+5. Curb export writes headerless P,N,E,Z,D values to three decimals, a source
+   CSV, confidence summary, conflict report, DO_NOT_STAKE list, HTML report,
+   water-flow PDF, and manifest. Contractor offsets move XY by the requested
+   distance and KEEP THE BC ELEVATION; they do not calculate ground elevation
+   at the offset location. Separate CSV/DXF outputs show the offset relationship.
+
+6. The other tools share some helpers but differ materially:
+   - Sidewalk: selected edge geometry; labels/LandXML/perpendicular contours/
+     contour TIN/fallback; optional width*slope adjustment; local median
+     replacement and optional cross-slope clamping; direct CSV export.
+   - Grade grid: buffered rectangular extents, not a clipped closed boundary;
+     grade assignment using the curb helper; Z_subgrade = Z_finished - thickness;
+     direct CSV export. The grid does not build the contour TIN used by curb.
+   - Storm/sanitary: detect structure centers, gather nearby invert text and PDF
+     label windows, choose the lowest explicit OUT (or lowest invert fallback),
+     append manually picked structures, then directly export.
+
+The last three tools do not call the curb sanitizer before write_csv.
+
+Arithmetic verified in the stated examples
+-----------------------------------------
+- Euclidean distances, clamped segment projection, ordinary intersections,
+  straight 25-foot station spacing, ordinary quarter-circle controls, and
+  positive/negative minor bulges agree with independent known answers.
+- Barycentric triangle interpolation agrees with Z=600+0.1X+0.2Y, including
+  200 deterministic interior points at large grid coordinates. A basic
+  contour TIN reproduces a plane. Feature-line Z interpolates linearly.
+- A clean 600-to-602 BC profile over 40 feet gives 601 at station 20, including
+  a full DXF/PDF generation and CSV check.
+- Explicit FL + 0.50, direct TC holds, the dedicated FL-touch helper,
+  and a trusted 612.345 HP hold pass their isolated examples.
+- Width*slope/100, explicit sidewalk add/subtract, direct mode, the numerical
+  cross-slope clamp, ray distance, and a ten-foot detected sidewalk width pass.
+- Three-foot offsets and reversed offsets move to the expected side and keep Z.
+- Two-point and non-reflected multi-point similarity transforms pass.
+- A flat 600-foot surface minus 0.50 outputs 599.50 subgrade in a fresh run.
+- PNEZD ordering and three-decimal output rounding pass. None and zero are
+  omitted. Ordinary LOW_CONF curb fallback is withheld. A 0.02-foot rise over
+  ten feet is correctly reported as 0.20 percent.
+- Six-inch detail conversion and the isolated conflicting-height helper pass.
+
+Reproducible findings requiring correction
+-----------------------------------------
+Source locations below refer to unchanged schoel_gradeguard.py in the active
+C:\SchoelTools\SchoelGradeGuard checkout. Test IDs refer to calculation_audit.py.
+
+1. BLOCKER: Held controls can be overwritten.
+   R05: full generation changed a manual TC 610.000 at station 20 to 601.000.
+   C11: source assignment turns a manual anchor with raw text 'TC 650.00' into
+   'CAD spot'; later string-based hold protection fails and TIN replaces it
+   with 605.000. Source provenance must remain structured and immutable.
+   Locations: nearest_label_elevation:2212, apply_bc_station_contour_profile_to_
+   normal_points:3980, apply_contour_surface_mode_v851:4388, run_generation:5186.
+
+2. BLOCKER: Curb height can be lost at selected flowline controls.
+   C06/R06: an actual FL crossing three feet from BC is also treated as a
+   'short-gap BC' contour. The short-gap candidate outranks the actual FL hit.
+   Full generation returned 601.000 at the midpoint instead of 601.500.
+   C12 also demonstrates an intermediate exact BC override being overwritten
+   by FL at the same coordinate. R07 shows that later corrections DO repair
+   the tested case where the same contours cross both BC and FL. Do not
+   generalize C12 alone as an uncorrected final CSV error in every such case.
+   Locations: add_contour_crossing_bc_points:1489,
+   curb_chain_contour_elevation:3293, run_generation:5186.
+
+3. BLOCKER: Disconnected curb runs share station controls.
+   C09: a missing grade 990 feet away inherited 600.000 because global station
+   accumulation omits the inter-run gap. C14: profile rebuilding mixed local
+   station numbers from separate components and changed 650.000 to 601.000.
+   Component identity is missing in the correction-stage anchor matching.
+   Locations: _bc_chain_station_for_point:3041,
+   fill_missing_bc_elevations_by_station_interpolation:3859,
+   rebuild_bc_profile_from_contours_v850:4268.
+
+4. BLOCKER: Earlier curb-job state can contaminate a grade-grid run.
+   R08: a previous exact contour override of 620 at the next grid coordinate
+   produced subgrade 619.500 from a newly supplied flat 600 surface; expected
+   599.500. DXF loading resets curb geometry but not the override dictionary
+   or all flowline state. Only the curb runner explicitly resets overrides.
+   Locations: globals:87-103, load_dxf_geometry_and_elevations:1182,
+   assign_elevations:3467, run_grade_grid_generation:6005.
+
+5. BLOCKER: Field export and QA status disagree.
+   E04: a point explicitly marked NOT BRACKETED stayed numeric after the curb
+   sanitizer because TIN_CONTOUR appeared in its history. Its QA status was RED,
+   yet write_csv still accepted it. C13: detecting a possible HP promotes a
+   LOW_CONF estimate into an accepted field elevation. E03: positive infinity
+   is accepted by stake_ready_points. That function only tests nonzero Z;
+   it does not establish source approval, finite XY/Z, or final QA status.
+   R01/R03/P02: sidewalk, grid, and FL OUT runs exported review-only values
+   without applying the curb sanitizer. Export approval needs a common gate.
+   Locations: tag_high_low_points:1650, sanitize_field_elevations:4509,
+   stake_ready_points:4644, gg_v9_status_for_point:4697;
+   runners:5698,5931,6005.
+
+6. BLOCKER: LandXML axes, surfaces, and reference metadata are not reliable.
+   I01: NEZ '1000 2000 600' becomes XY=(1000,2000), expected (2000,1000).
+   I02 passes only because that coordinate magnitude matches the heuristic.
+   I03: two surfaces reusing IDs 1/2/3 lose the first surface's vertices; both
+   faces use the last surface's points (700 instead of separate 600 and 700).
+   I04: declared meter data is accepted without conversion or rejection in
+   the stated foot workflow. The importer does not select a named surface,
+   enforce CRS/datum/vertical reference, or validate units against DXF.
+   LandXML point order is NEZ; see ICSM LandXML Mapping, section 3.42:
+   https://www.anzlic.gov.au/sites/default/files/files/ePlan-Protocol-LandXML-Mapping-v2.1.4.pdf
+   Locations: _parse_landxml_xyz:817, load_landxml_surface:843.
+
+7. HIGH: Selected LandXML can silently disappear or lose precedence.
+   I05: corrupt selected XML returns None with no propagated error, enabling
+   fallback. C10: later TIN correction replaces an existing LandXML 650.000
+   with 605.000. The UI source_mode is saved and controls a missing-file prompt
+   but is not passed as a source-selection policy to the generation engine.
+   Locations: assign_elevations:3467, apply_contour_surface_mode_v851:4388,
+   safe_load_landxml_surface:6081, GradeGuardApp.generate:7537.
+
+8. HIGH: Contour interpolation can invent unsupported controls.
+   S09: two contours both east of the point are treated as a bracket, returning
+   600.666667 instead of an unresolved/review result. S07: coincident XY with
+   600 and 640 Z is averaged to a trusted 620. S03: a point one foot outside a
+   1000-foot triangle receives SURFACE_HIGH due to a dimensionless tolerance.
+   Static review also found unrestricted Delaunay triangulation, no breakline
+   constraints/hole boundaries, and no maximum triangle-edge check. These allow
+   bridging gaps; the audit has not quantified errors on an actual project TIN.
+   SciPy documents the triangulation and barycentric interface used here:
+   https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.Delaunay.html
+   Locations: landxml_elevation_at:945, build_contour_tin_surface:2655,
+   local_contour_prorated_elevation:2895.
+
+9. HIGH: PDF alignment has a reflected-transform sign error.
+   T03: four exact controls for E=100+2X,N=200-2Y yield RMSE 14.142136 feet,
+   rather than zero. The reflected least-squares row uses [y,-x] where the
+   declared coefficient model needs [-y,x]. T04 also accepts coincident
+   controls without an underdetermined-model warning. Automatic PDF extraction
+   uses a separate affine routine, so T03 is specifically the saved/manual
+   alignment path, not proof that every automatic overlay has this error.
+   Static review: text centers are used as coordinate controls; the layout
+   transform is reused on the grading page without verifying page registration.
+   A small fit residual alone does not establish the correct physical tick.
+   Locations: affine_from_layout_coordinates:1831,
+   extract_pdf_spot_labels:2133, affine_transform_from_points:5047.
+
+10. HIGH: Ambiguous BOC still supplies grades.
+    C03: bare BOC 612.34 parses as BC. C04: HP_BOC_AMBIG falls through generic
+    nearest-label lookup and supplies 612.34. This conflicts with the preflight
+    statement that BOC is review-only. Parser detection and downstream approval
+    need to enforce the same rule.
+    Locations: parse_grade_text:132, nearest_label_elevation:2212.
+
+11. HIGH: Structure identity and center calculations can be wrong.
+    P03: DI-1 OUT 610 becomes 600 when nearby DI-2 has OUT 600; the runner takes
+    the minimum of nearby values without excluding other structure identities.
+    P02: an IN-only invert is exported as FL OUT with a review note.
+    P04: a closed 4x4 square centers at (1.6,1.6), expected (2,2); its closing
+    vertex is counted twice. Vertex averaging also is not a general centroid.
+    PDF label windows can contain multiple neighboring structures (static review).
+    P02/P03 mock candidate detection to isolate association; P04 uses a real
+    synthetic DXF through the detector.
+    Locations: load_dxf_structures_and_text:5564,
+    extract_pdf_flout_text:5640, run_flout_generation:5698.
+
+12. HIGH: Several supported curve geometries are misread.
+    G08/G09: bulges +/-2 produce up to 7.50 feet radial disagreement on a
+    ten-foot chord. The center-side formula fails for arcs exceeding 180 degrees.
+    G10: full ellipse samples only 0..1 radians; minimum X is +5.403 instead
+    of -10. G11: a negative-extrusion ARC starts at +10 instead of WCS -10.
+    Independent ezdxf reference and coordinate-system documentation:
+    https://ezdxf.readthedocs.io/en/stable/math/core.html#bulge-related-functions
+    https://ezdxf.readthedocs.io/en/stable/dxfentities/ellipse.html
+    https://ezdxf.readthedocs.io/en/stable/dxfentities/arc.html
+    Locations: arc_points_from_entity:190, bulge_segment_points:240,
+    picker_entity_points:338. Other OCS/polyline/block combinations still need
+    dedicated geometry fixtures before being claimed correct.
+
+13. HIGH: Sidewalk cleanup can change design rather than flag a conflict.
+    W04: an explicit held 602 spot is replaced with neighboring median 600.
+    Auto cross-slope mode also lowers the high side to its entered limit;
+    the arithmetic passes W05, but a numerical clamp is not design approval.
+    Direct/manual/LandXML holds need protection and reviewable proposed changes.
+    Locations: enforce_sidewalk_cross_slope_pairs:2563,
+    enforce_sidewalk_local_reasonableness:5891.
+
+14. MEDIUM: Hard-coded elevation ranges and fallback substitutions remain.
+    S10/S11: valid 600/610 contours and a 50/52-foot site are rejected by local
+    interpolation. C08: HP hard-lock rejects 50 feet. Different functions use
+    conflicting 100..2000, +/-10000, and up-to-100000 limits. I06: a DXF line
+    from 600 to zero becomes a flat 600 line instead of retaining or rejecting
+    the zero endpoint. entity_z also considers CAD thickness as possible Z.
+    These are method-specific failures; another fallback may sometimes mask them.
+    Locations: entity_z:710, DXF importer:1182,
+    local_contour_prorated_elevation:2895, hard_lock_hp_lp_callout_elevations:3801.
+
+15. MEDIUM: Flow diagnostics follow output order, not verified connectivity.
+    F02: points on separate parallel runs are reported as one flat segment.
+    Water-flow arrows and conflict checks also pair consecutive output points;
+    they can join unrelated runs or skip missing intermediate points. The
+    conflict threshold is a fixed elevation jump, not a project-approved grade
+    threshold. These reports are diagnostics, not drainage validation.
+    Locations: add_flow_warnings:3602,
+    write_surface_conflict_report_csv:4758, write_water_flow_pdf:4851.
+
+Additional static-review concerns, not counted as independently reproduced bugs
+-----------------------------------------------------------------------------
+- Surface bounds, hidden/excluded faces, multiple models, LandXML curve geometry,
+  and discontinuities are not represented robustly. Feature curves become chords.
+- Curb presets override PDF-height verification and mark the user selection as
+  verified; the program cannot verify the PDF is signed/certified or the chosen
+  height applies to every local ramp, transition, catch, or spill section.
+- Ordinary spot lookup uses a search radius, label kind, and source string rather
+  than explicit ownership of a specific tick/curb component. CAD HP/LP projection
+  can accept a text location up to 140 feet from the curb without a valid leader.
+- Grid limits include a buffer around rectangular extents, including outside
+  an actual irregular site boundary. Existing vs proposed contour layer selection
+  must be explicit; a layer containing CONT is not evidence of design authority.
+- Persistent selected-handle files store their CAD path, but loader selection is
+  based on handles alone. Wrong-job selections need identity checks.
+- Zero/negative/nonfinite settings and range limits are not consistently validated
+  before calculation. Zero spacing can fail; negative spacing can omit stations.
+- AutoLISP importers split CSV naively, convert Z through atof without checking
+  blanks, and 3D commands connect all imported points by file order. Source review
+  only: no AutoCAD/Civil 3D session was used to validate import behavior. Blank
+  withheld elevations must not be allowed to become a believable plotted grade.
+- Generated filenames are fixed; reruns can overwrite earlier review products.
+- No project control/benchmark residual, US-survey-foot vs international-foot
+  validation, horizontal/vertical datum transformation, or geoid check is present.
+  The absence of a transformation is not evidence that input references agree.
+
+Recommended correction sequence
+-------------------------------
+1. Implement a shared finite-coordinate and approved-source export gate for all
+   four tools. A blocking status must prevent field export. Preserve excluded
+   values only in explicit review reports. Prevent text-history tokens from
+   promoting untrusted values or inferred HP/LP candidates.
+2. Preserve typed source identity and immutable held controls. Reset all job
+   state. Establish one documented precedence policy instead of successive
+   unrestricted elevation-replacement passes. Wire the source selector to it.
+3. Correct LandXML NEZ parsing and per-surface IDs; require surface selection and
+   explicit units/references; fail visibly for unusable selected sources.
+4. Fix connected-run stationing, exact BC/FL precedence, geometric imports,
+   reflected alignment, and structure association/centers. Use focused regression
+   cases rather than smoothing to hide disagreements.
+5. Replace unsafe contour fallbacks with explicit review; preserve boundaries,
+   breaklines and conflicts; make tolerances project-approved and traceable.
+6. Rerun this audit plus nearby regressions, build a separately versioned preview,
+   and compare real approved CAD/LandXML/PDF jobs with independent office checks.
+   Include BC and FL controls, curves, HP/LP, ramps, separate runs, sidewalk edges,
+   structure IN/OUT schedules, and subgrade points. Record residuals and sign-off.
+
+Evidence and reproducibility
+----------------------------
+Active source: C:\SchoelTools\SchoelGradeGuard\schoel_gradeguard.py
+Source SHA256: 3b8f93f0f008f2e17cef31809916464a905bb0ca3cc1db3d208d9f9ffd160726
+Base Git commit: 232ae13e7f8658bb1ba439b5f30b524026d06dd4
+Branch: feature/simpler-workflow, with existing 9.2/9.3 local changes retained.
+Installed libraries tested: ezdxf 1.3.5, scipy 1.17.1, numpy 2.1.3,
+PyMuPDF 1.27.2.2, reportlab 4.2.5. No dependency updates were made.
+
+From C:\SchoelTools\SchoelGradeGuard:
+  python -m unittest discover -s tests -v
+  python tests\calculation_audit.py --report <path-to-a-new-report.json>
+
+The audit exits 1 while any unresolved checks FAIL; this is expected and must
+not be relabeled as a passing test suite. Each check records expected/actual
+values. All fixtures are temporary synthetic files. Structure association cases
+inject controlled detector results; selected surface cases inject known planar
+surfaces to isolate arithmetic/state. Full DXF/PDF cases use actual parsers and
+CSV writers; only the water-flow PDF renderer is stubbed in those cases.
+
+The accompanying JSON includes every result and functions exercised. Function
+invocation is not branch coverage or proof of correctness. Calculations were
+reviewed across all four generation workflows, but this is not exhaustive proof
+for every CAD entity, PDF layout, malformed input, surface topology, or field
+condition. PDF visual layout, installer behavior, executable-internal dependency
+equivalence, and AutoCAD interaction were not retested in this calculation audit.
+No supplied real project/control/check-shot dataset was available in this turn.
+Office comparison and appropriate licensed review remain necessary after fixes.
